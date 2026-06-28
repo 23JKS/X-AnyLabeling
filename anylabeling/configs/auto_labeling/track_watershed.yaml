@@ -1,0 +1,12 @@
+# Track Particle Band Segmenter
+type: track_watershed
+name: track_watershed-r20250601
+provider: Local
+display_name: Track Band (Particle)
+
+# Parameters
+threshold_percentile: 90.0
+threshold_hi_percentile: 95.0
+min_size: 200
+dilation_radius: 4
+border_y_fraction: 0.75

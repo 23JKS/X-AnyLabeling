@@ -1,0 +1,49 @@
+# Lightweight Track Centerline Model Configuration
+# MobileNetV2 + reduced UNet++ (~2.8M params)
+
+data:
+  root_dir: D:/desk/data/log
+  annotation_file: annotations.xml
+  train_split: 0.75
+  patch_size: 256
+  centerline_width: 5
+  num_workers: 0
+
+model:
+  encoder: mobilenet_v2
+  encoder_weights: imagenet
+  in_channels: 3
+  embedding_dim: 4
+  decoder_channels: [128, 64, 32, 16, 16]
+
+training:
+  epochs: 50
+  batch_size: 8
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  mixed_precision: false
+  grad_clip: 1.0
+  early_stopping_patience: 20
+
+loss:
+  semantic:
+    bce_weight: 0.5
+    dice_weight: 0.5
+  embedding:
+    weight: 0.5
+    delta_v: 0.5
+    delta_d: 1.5
+    reg_weight: 0.001
+
+postprocess:
+  semantic_threshold: 0.5
+  dbscan_eps: 0.5
+  dbscan_min_samples: 10
+  min_component_size: 50
+
+logging:
+  log_dir: ./logs
+  checkpoint_dir: ./checkpoints
+  log_interval: 5
+  val_interval: 2
+  save_interval: 20

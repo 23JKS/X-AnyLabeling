@@ -1,0 +1,9 @@
+p=r'D:\desk\X-AnyLabeling\anylabeling\views\labeling\widgets\auto_labeling\auto_labeling.py'
+c=open(p,encoding='utf-8').read()
+q=chr(34)
+s=c.find('def _on_toggle_band(self):')
+e=c.find('def _on_shape_selected',s)
+new='''def _on_toggle_band(self):\n'''  self._band_mode = not self._band_mode\n'''  if self._band_mode:\n'''    self._centerline_shapes = []\n'''    self._band_shapes = []\n'''    width = self.edit_track_width.value()\n'''    new_shapes = []\n'''    for s in self.parent.canvas.shapes:\n'''      if s.other_data.get("_is_band"): continue\n'''      if s.label.startswith("track") and s.shape_type in ("linestrip","line"):\n'''        self._centerline_shapes.append(s)\n'''        if len(s.points) >= 2:\n'''          cl = [(p.x(), p.y()) for p in s.points]\n'''          s.other_data["centerline"] = cl\n'''          w = s.other_data.get("track_width", width)\n'''          band_pts = self._regenerate_band_polygon(cl, w/2.0)\n'''          bs = type(s)(label=s.label, shape_type="polygon", flags={})\n'''          bs.other_data["_is_band"] = True\n'''          bs.other_data["centerline"] = cl\n'''          bs.other_data["track_width"] = w\n'''          bs.fill = True\n'''          for x,y in band_pts: bs.add_point(QPointF(x,y))\n'''          self._band_shapes.append(bs)\n'''    self.parent.canvas.shapes = new_shapes + self._band_shapes\n'''  else:\n'''    self.parent.canvas.shapes = [s for s in self.parent.canvas.shapes if not s.other_data.get("_is_band")]\n'''    self.parent.canvas.shapes.extend(self._centerline_shapes)\n'''  self.parent.canvas.selection_changed.disconnect(self._on_shape_selected)\n'''  self.parent.canvas.selection_changed.connect(self._on_shape_selected)\n'''  self.button_toggle_band.setText(self.tr("..") if self._band_mode else self.tr(".."))\n'''  self.parent.canvas.update()\n'''
+c=c[:s]+new+c[e:]
+open(p,'w',encoding='utf-8').write(c)
+print(1)

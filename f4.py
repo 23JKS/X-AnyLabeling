@@ -1,0 +1,10 @@
+p='D:\desk\X-AnyLabeling\anylabeling\views\labeling\widgets\auto_labeling\auto_labeling.py'
+c=open(p,encoding='utf-8').read()
+q="
+nl='\n'
+s=c.find('def _on_toggle_band(self):')
+e=c.find('def _on_shape_selected',s)
+new=nl.join(['def _on_toggle_band(self):','        self._band_mode = not self._band_mode','        if self._band_mode:','            self._centerline_shapes = []','            self._band_shapes = []','            width = self.edit_track_width.value()','            kept = []','            for s in self.parent.canvas.shapes:','                if s.other_data.get("_is_band"): continue','                if s.label.startswith("track") and s.shape_type in ("linestrip","line"):','                    self._centerline_shapes.append(s)','                    if len(s.points) >= 2:','                        cl = [(p.x(), p.y()) for p in s.points]','                        s.other_data["centerline"] = cl','                        w = s.other_data.get("track_width", width)','                        band_pts = self._regenerate_band_polygon(cl, w / 2.0)','                        bs = type(s)(label=s.label, shape_type="polygon", flags={})','                        bs.other_data["_is_band"] = True','                        bs.other_data["centerline"] = cl','                        bs.other_data["track_width'] = w','                        bs.fill = True','                        for x, y in band_pts:','                            bs.add_point(QPointF(x, y))','                        self._band_shapes.append(bs)','                else:','                    kept.append(s)','            self.parent.canvas.shapes = kept + self._band_shapes','        else:','            self.parent.canvas.shapes = [s for s in self.parent.canvas.shapes if not s.other_data.get("_is_band")]','            self.parent.canvas.shapes.extend(self._centerline_shapes)','        self.button_toggle_band.setText(self.tr("'''") if self._band_mode else self.tr("'''"))','        self.parent.canvas.update()'])
+c=c[:s]+new+nl+c[e:]
+open(p,'w',encoding='utf-8').write(c)
+print(len(new))

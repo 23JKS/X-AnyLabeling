@@ -1,0 +1,5 @@
+type: track_centerline_light
+name: track_centerline_light
+provider: Local
+display_name: Track Centerline (Light)
+model_path: D:/desk/X-AnyLabeling/lightweight_model/checkpoints/best_model_inference.pth
