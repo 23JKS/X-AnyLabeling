@@ -2292,6 +2292,46 @@ class ModelManager(QObject):
                     f"Error in loading model: {model_config['type']} with error: {str(e)}"
                 )
                 return
+        elif model_config["type"] == "track_instance_seg":
+            from .track_instance_seg import TrackInstanceSeg
+
+            try:
+                model_config["model"] = TrackInstanceSeg(
+                    model_config, on_message=self.new_model_status.emit
+                )
+                self.auto_segmentation_model_unselected.emit()
+                logger.info(
+                    f"Model loaded successfully: {model_config['type']}"
+                )
+            except Exception as e:
+                template = "Error in loading model: {error_message}"
+                translated_template = self.tr(template)
+                error_text = translated_template.format(error_message=str(e))
+                self.new_model_status.emit(error_text)
+                logger.error(
+                    f"Error in loading model: {model_config['type']} with error: {str(e)}"
+                )
+                return
+        elif model_config["type"] == "track_mask2former":
+            from .track_mask2former import TrackMask2Former
+
+            try:
+                model_config["model"] = TrackMask2Former(
+                    model_config, on_message=self.new_model_status.emit
+                )
+                self.auto_segmentation_model_unselected.emit()
+                logger.info(
+                    f"✅ Model loaded successfully: {model_config['type']}"
+                )
+            except Exception as e:
+                template = "Error in loading model: {error_message}"
+                translated_template = self.tr(template)
+                error_text = translated_template.format(error_message=str(e))
+                self.new_model_status.emit(error_text)
+                logger.error(
+                    f"❌ Error in loading model: {model_config['type']} with error: {str(e)}"
+                )
+                return
         else:
             raise Exception(f"Unknown model type: {model_config['type']}")
 
@@ -2408,6 +2448,27 @@ class ModelManager(QObject):
             model = self.loaded_model_config.get("model")
             if model and hasattr(model, "set_auto_labeling_track_width"):
                 model.set_auto_labeling_track_width(value)
+
+    def set_auto_labeling_arc_residual(self, enabled: bool):
+        """Enable / disable arc-residual split-merge refinement."""
+        if self.loaded_model_config is not None:
+            model = self.loaded_model_config.get("model")
+            if model and hasattr(model, "set_auto_labeling_arc_residual"):
+                model.set_auto_labeling_arc_residual(enabled)
+
+    def set_auto_labeling_arc_split_nrmse(self, value: float):
+        """Set arc-residual split NRMSE threshold."""
+        if self.loaded_model_config is not None:
+            model = self.loaded_model_config.get("model")
+            if model and hasattr(model, "set_auto_labeling_arc_split_nrmse"):
+                model.set_auto_labeling_arc_split_nrmse(value)
+
+    def set_auto_labeling_arc_merge_nrmse(self, value: float):
+        """Set arc-residual merge NRMSE threshold."""
+        if self.loaded_model_config is not None:
+            model = self.loaded_model_config.get("model")
+            if model and hasattr(model, "set_auto_labeling_arc_merge_nrmse"):
+                model.set_auto_labeling_arc_merge_nrmse(value)
 
     def unload_model(self):
         """Unload model"""

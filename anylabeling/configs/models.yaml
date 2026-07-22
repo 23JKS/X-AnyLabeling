@@ -382,4 +382,8 @@
   config_file: "D:/desk/X-AnyLabeling/anylabeling/configs/auto_labeling/track_centerline_r18.yaml"
 - model_name: "track_centerline_light"
   config_file: "D:/desk/X-AnyLabeling/anylabeling/configs/auto_labeling/track_centerline_light.yaml"
+- model_name: "track_instance_seg"
+  config_file: "D:/desk/X-AnyLabeling/anylabeling/configs/auto_labeling/track_instance_seg.yaml"
+- model_name: "track_mask2former"
+  config_file: "D:/desk/X-AnyLabeling/anylabeling/configs/auto_labeling/track_mask2former.yaml"
 

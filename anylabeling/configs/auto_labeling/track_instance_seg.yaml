@@ -1,0 +1,14 @@
+type: track_instance_seg
+name: track_instance_seg
+provider: Local
+display_name: Track Instance Segmentation
+model_path: D:/desk/data/log/project/checkpoints/best_model.pth
+plate_model_path: D:/desk/data/log/project/data_seg_yolo/runs/plate_yolov8n/weights/best.pt
+conf_threshold: 0.5
+# --- Arc-residual refinement (UI toggle, off by default) ---
+arc_residual:
+  split_nrmse: 0.05
+  merge_nrmse: 0.03
+  merge_r_tol: 0.10
+  merge_phi_tol: 0.15
+  merge_gap: 40

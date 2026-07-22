@@ -300,6 +300,7 @@ class BatchProcessingThread(QThread):
     def run(self):
         total_images = len(self.image_list)
         try:
+            from anylabeling.views.labeling.utils.image import img_data_to_qimage
             while (
                 self.image_index < total_images
                 and not self.app.cancel_processing
@@ -310,16 +311,21 @@ class BatchProcessingThread(QThread):
                     current, f"Progress: {current}/{total_images}"
                 )
 
+                # Load the actual image for this file instead of using current canvas image
+                image = img_data_to_qimage(
+                    open(image_file, "rb").read(), image_file
+                )
+
                 if self.text_prompt:
                     result = self.app.auto_labeling_widget.model_manager.predict_shapes(
-                        self.app.image,
+                        image,
                         image_file,
                         text_prompt=self.text_prompt,
                         batch=True,
                     )
                 elif self.run_tracker:
                     result = self.app.auto_labeling_widget.model_manager.predict_shapes(
-                        self.app.image,
+                        image,
                         image_file,
                         run_tracker=self.run_tracker,
                         batch=True,
@@ -332,7 +338,7 @@ class BatchProcessingThread(QThread):
                     ):
                         existing_shapes = load_existing_shapes(image_file)
                     result = self.app.auto_labeling_widget.model_manager.predict_shapes(
-                        self.app.image,
+                        image,
                         image_file,
                         batch=True,
                         existing_shapes=existing_shapes,

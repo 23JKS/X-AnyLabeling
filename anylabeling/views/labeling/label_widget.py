@@ -6254,10 +6254,54 @@ class LabelingWidget(LabelDialog):
 
     def delete_selected_shape(self):
         self.remove_labels(self.canvas.delete_selected())
+        self._renumber_tracks_and_sources()
         self.set_dirty()
         if self.no_shape():
             for action in self.actions.on_shapes_present:
                 action.setEnabled(False)
+
+    def _renumber_tracks_and_sources(self):
+        """删除 shape 后重新编号 track_N 和 source_N，按 x 坐标从左往右."""
+        import re
+
+        # 收集 track 和 source
+        tracks = []
+        sources = []
+        for s in self.canvas.shapes:
+            if re.match(r"^track_\d+$", s.label):
+                tracks.append(s)
+            elif re.match(r"^source_\d+$", s.label):
+                sources.append(s)
+
+        # 按中心线最底部（y 最大）的 x 坐标从左往右排序
+        def _bottom_x(shape):
+            cl = shape.other_data.get("centerline") if shape.other_data else None
+            if cl:
+                # track: 用 centerline 底部点
+                bottom = max(cl, key=lambda p: p[1])  # (x, y), 取 y 最大
+                return bottom[0]
+            # source / 无 centerline: 用多边形底部点
+            pts = shape.points
+            if not pts:
+                return 0.0
+            max_y = max(p.y() for p in pts)
+            return min(p.x() for p in pts if p.y() == max_y)
+        tracks.sort(key=_bottom_x)
+        sources.sort(key=_bottom_x)
+
+        # 重新编号
+        for i, s in enumerate(tracks, 1):
+            new_label = f"track_{i}"
+            if s.label != new_label:
+                s.label = new_label
+        for i, s in enumerate(sources, 1):
+            new_label = f"source_{i}"
+            if s.label != new_label:
+                s.label = new_label
+
+        # 刷新 UI
+        self.canvas.update()
+        self.label_list.update()
 
     def copy_shape(self):
         self.canvas.end_move(copy=True)
@@ -6405,6 +6449,61 @@ class LabelingWidget(LabelDialog):
             self.actions.run_all_images.setEnabled(True)
         self.update_thumbnail_display()
 
+    def _save_result_to_file(self, image_path, auto_labeling_result):
+        """Save auto labeling result to the correct image's JSON file."""
+        try:
+            import json, base64
+            from anylabeling.app_info import __version__
+            from anylabeling.views.labeling.utils._io import io_open
+
+            label_file = osp.splitext(image_path)[0] + ".json"
+            if self.output_dir:
+                label_file = osp.join(
+                    self.output_dir, osp.basename(label_file)
+                )
+
+            new_shapes = [
+                shape.to_dict() for shape in auto_labeling_result.shapes
+            ] if auto_labeling_result else []
+
+            if osp.exists(label_file):
+                with io_open(label_file, "r") as f:
+                    data = json.load(f)
+                if auto_labeling_result.replace:
+                    data["shapes"] = new_shapes
+                else:
+                    data["shapes"].extend(new_shapes)
+            else:
+                if self._config.get("store_data"):
+                    with open(image_path, "rb") as f:
+                        image_data = f.read()
+                    image_data = base64.b64encode(image_data).decode("utf-8")
+                else:
+                    image_data = None
+                image_path_rel = osp.basename(image_path)
+                from PIL import Image
+                with Image.open(image_path) as img:
+                    w, h = img.size
+                data = {
+                    "version": __version__,
+                    "flags": {},
+                    "shapes": new_shapes,
+                    "imagePath": image_path_rel,
+                    "imageData": image_data,
+                    "imageHeight": h,
+                    "imageWidth": w,
+                    "description": getattr(auto_labeling_result, "description", "") or "",
+                }
+
+            with io_open(label_file, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            logger.info(
+                f"Saved stale auto labeling result to {label_file}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to save stale result: {e}")
+
     @pyqtSlot()
     def new_shapes_from_auto_labeling(self, auto_labeling_result):
         """Apply auto labeling results to the current image."""
@@ -6416,10 +6515,8 @@ class LabelingWidget(LabelDialog):
             current_filename = osp.normpath(osp.abspath(self.filename))
             result_filename = osp.normpath(osp.abspath(result_image_path))
             if result_filename != current_filename:
-                logger.warning(
-                    "Ignore stale auto labeling result for "
-                    f"{result_filename}; current file is {current_filename}"
-                )
+                # Save stale result to the correct image's JSON file instead of discarding
+                self._save_result_to_file(result_filename, auto_labeling_result)
                 return
 
         # Clear existing shapes
@@ -6444,6 +6541,7 @@ class LabelingWidget(LabelDialog):
             self.other_data["description"] = description
             self.shape_text_edit.setDisabled(False)
 
+        self._renumber_tracks_and_sources()
         self.set_dirty()
 
     def clear_auto_labeling_marks(self):

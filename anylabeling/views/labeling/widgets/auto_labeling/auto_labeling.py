@@ -1,6 +1,7 @@
 import os
 import yaml
 import collections
+from pathlib import Path
 
 from anylabeling.config import get_config
 
@@ -8,6 +9,7 @@ from PyQt6 import uic
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QPoint, QPointF, QTimer
 from PyQt6.QtWidgets import (
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -24,6 +26,7 @@ from anylabeling.services.auto_labeling import (
     _SKIP_DET_MODELS,
     _SKIP_PREDICTION_ON_NEW_MARKS_MODELS,
 )
+from anylabeling.services.auto_labeling.energy_spectrum import compute_spectra
 from anylabeling.views.labeling.chatbot.style import ChatbotDialogStyle
 from anylabeling.views.labeling.logger import logger
 from anylabeling.views.labeling.utils.theme import get_theme
@@ -436,6 +439,64 @@ class AutoLabelingWidget(QWidget):
         self.parent.canvas.selection_changed.connect(
             self._on_shape_selected
         )
+
+        # ---- Arc-residual controls (created programmatically) ----
+        self.toggle_arc_residual = QPushButton(self.tr("Arc Refine (Off)"))
+        self.toggle_arc_residual.setCheckable(True)
+        self.toggle_arc_residual.setChecked(False)
+        self.toggle_arc_residual.setToolTip(
+            self.tr("Enable arc-residual split/merge refinement")
+        )
+        self.toggle_arc_residual.clicked.connect(
+            self._on_toggle_arc_residual
+        )
+        self.verticalLayout.addWidget(self.toggle_arc_residual)
+
+        self.arc_split_nrmse_widget = QWidget()
+        split_layout = QHBoxLayout(self.arc_split_nrmse_widget)
+        split_layout.setSpacing(8)
+        split_label = QLabel(self.tr("Split NRMSE"))
+        split_label.setMinimumSize(0, 16)
+        self.edit_arc_split_nrmse = QDoubleSpinBox()
+        self.edit_arc_split_nrmse.setMinimumSize(80, 0)
+        self.edit_arc_split_nrmse.setDecimals(4)
+        self.edit_arc_split_nrmse.setRange(0.001, 1.0)
+        self.edit_arc_split_nrmse.setSingleStep(0.01)
+        self.edit_arc_split_nrmse.setValue(0.05)
+        self.edit_arc_split_nrmse.valueChanged.connect(
+            self._on_arc_split_nrmse_changed
+        )
+        split_layout.addWidget(split_label)
+        split_layout.addWidget(self.edit_arc_split_nrmse)
+        self.verticalLayout.addWidget(self.arc_split_nrmse_widget)
+
+        self.arc_merge_nrmse_widget = QWidget()
+        merge_layout = QHBoxLayout(self.arc_merge_nrmse_widget)
+        merge_layout.setSpacing(8)
+        merge_label = QLabel(self.tr("Merge NRMSE"))
+        merge_label.setMinimumSize(0, 16)
+        self.edit_arc_merge_nrmse = QDoubleSpinBox()
+        self.edit_arc_merge_nrmse.setMinimumSize(80, 0)
+        self.edit_arc_merge_nrmse.setDecimals(4)
+        self.edit_arc_merge_nrmse.setRange(0.001, 1.0)
+        self.edit_arc_merge_nrmse.setSingleStep(0.01)
+        self.edit_arc_merge_nrmse.setValue(0.03)
+        self.edit_arc_merge_nrmse.valueChanged.connect(
+            self._on_arc_merge_nrmse_changed
+        )
+        merge_layout.addWidget(merge_label)
+        merge_layout.addWidget(self.edit_arc_merge_nrmse)
+        self.verticalLayout.addWidget(self.arc_merge_nrmse_widget)
+
+        # ---- Energy spectrum button (for track_mask2former) ----
+        self.button_energy_spectrum = QPushButton(self.tr("计算能谱图"))
+        self.button_energy_spectrum.setToolTip(
+            self.tr("对当前图片中的所有轨迹计算能谱图")
+        )
+        self.button_energy_spectrum.clicked.connect(
+            self._on_energy_spectrum
+        )
+        self.verticalLayout.addWidget(self.button_energy_spectrum)
 
         # ===================================
         #  End of Auto labeling buttons
@@ -1085,6 +1146,59 @@ class AutoLabelingWidget(QWidget):
         elif model_config.get("type") == "remote_server":
             self.update_remote_server_mode_ui()
 
+        # Initialize track centerline sliders to model
+        if model_config.get("type") in ("track_centerline", "track_centerline_light", "track_mask2former"):
+            self.model_manager.set_auto_labeling_min_track_length(
+                self.edit_min_track_length.value()
+            )
+            self.model_manager.set_auto_labeling_keypoint_interval(
+                self.edit_keypoint_interval.value()
+            )
+            self.model_manager.set_auto_labeling_track_width(
+                self.edit_track_width.value()
+            )
+
+        # Initialize arc-residual controls for track_instance_seg
+        if model_config.get("type") == "track_instance_seg":
+            self.toggle_arc_residual.setChecked(False)
+            self._on_toggle_arc_residual(False)
+            self.model_manager.set_auto_labeling_arc_residual(
+                self.toggle_arc_residual.isChecked()
+            )
+            self.model_manager.set_auto_labeling_arc_split_nrmse(
+                self.edit_arc_split_nrmse.value()
+            )
+            self.model_manager.set_auto_labeling_arc_merge_nrmse(
+                self.edit_arc_merge_nrmse.value()
+            )
+
+        if model_config.get("type") not in ("track_centerline", "track_mask2former"):
+            self._editing_track_shape = None
+            self.input_track_width.hide()
+            self.edit_track_width.hide()
+            self.input_per_track_width.hide()
+            self.edit_per_track_width.hide()
+            self.button_toggle_band.hide()
+
+    def _on_toggle_arc_residual(self, checked):
+        """Handle arc-residual toggle."""
+        if checked:
+            self.toggle_arc_residual.setText(self.tr("Arc Refine (On)"))
+        else:
+            self.toggle_arc_residual.setText(self.tr("Arc Refine (Off)"))
+        self.arc_split_nrmse_widget.setVisible(checked)
+        self.arc_merge_nrmse_widget.setVisible(checked)
+        self._update_model_selection_scroll_area_height()
+        self.model_manager.set_auto_labeling_arc_residual(checked)
+
+    def _on_arc_split_nrmse_changed(self, value):
+        """Handle arc split NRMSE threshold change."""
+        self.model_manager.set_auto_labeling_arc_split_nrmse(value)
+
+    def _on_arc_merge_nrmse_changed(self, value):
+        """Handle arc merge NRMSE threshold change."""
+        self.model_manager.set_auto_labeling_arc_merge_nrmse(value)
+
     def update_upn_mode_ui(self):
         """Update UPN mode combobox to reflect current backend state"""
         current_mode = self.model_manager.loaded_model_config[
@@ -1139,6 +1253,7 @@ class AutoLabelingWidget(QWidget):
         """Update widget status"""
         if not model_config or "model" not in model_config:
             return
+        self.hide_labeling_widgets()
         widgets = model_config["model"].get_required_widgets()
         for widget_name in widgets:
             if hasattr(self, widget_name):
@@ -1193,6 +1308,10 @@ class AutoLabelingWidget(QWidget):
             "edit_per_track_width",
             "input_per_track_width",
             "button_toggle_band",
+            "button_energy_spectrum",
+            "toggle_arc_residual",
+            "arc_split_nrmse_widget",
+            "arc_merge_nrmse_widget",
         ]
         for widget in widgets:
             getattr(self, widget).hide()
@@ -1949,6 +2068,11 @@ class AutoLabelingWidget(QWidget):
     def _on_shape_selected(self, selected_shapes):
         """Handle shape selection: if band polygon clicked, show per-track width slider."""
         self._editing_track_shape = None
+        loaded_config = self.model_manager.loaded_model_config or {}
+        if loaded_config.get("type") not in ("track_centerline", "track_mask2former"):
+            self.input_per_track_width.hide()
+            self.edit_per_track_width.hide()
+            return
         if len(selected_shapes) == 1 and self._band_mode:
             shape = selected_shapes[0]
             if shape.other_data.get("_is_band") and shape.other_data.get("track_width"):
@@ -1997,3 +2121,59 @@ class AutoLabelingWidget(QWidget):
         self.mask_fineness_value_label.setText(f"{epsilon:.4f}")
         self.model_manager.set_mask_fineness(epsilon)
         self.mask_fineness_changed.emit(epsilon)
+
+    def _on_energy_spectrum(self):
+        """计算当前图片所有轨迹的能谱图"""
+        image_path = getattr(self.parent, "image_path", None)
+        if not image_path or not os.path.isfile(image_path):
+            self.model_manager.new_model_status.emit(
+                self.tr("无法获取当前图片路径")
+            )
+            return
+
+        # 收集 canvas 上的所有 shape
+        canvas = self.parent.canvas
+        exclude_labels = {AutoLabelingMode.OBJECT, AutoLabelingMode.ADD, AutoLabelingMode.REMOVE}
+        shapes = []
+        for s in canvas.shapes:
+            if s.label in exclude_labels:
+                continue
+            d = {
+                "label": s.label,
+                "points": [[p.x(), p.y()] for p in s.points],
+                "shape_type": s.shape_type,
+                "other_data": dict(s.other_data) if s.other_data else {},
+            }
+            shapes.append(d)
+
+        track_count = sum(1 for s in shapes if s["label"].startswith("track"))
+        source_count = sum(1 for s in shapes if s["label"].startswith("source"))
+        if track_count == 0:
+            self.model_manager.new_model_status.emit(
+                self.tr("当前图片没有轨迹，请先运行推理")
+            )
+            return
+
+        output_dir = Path(image_path).parent / Path(image_path).stem
+        self.model_manager.new_model_status.emit(
+            f"正在计算能谱图... {track_count} 条轨迹, {source_count} 个 source → {output_dir}"
+        )
+
+        try:
+            result = compute_spectra(
+                image_path=image_path,
+                shapes=shapes,
+                output_dir=str(output_dir),
+                progress_callback=self.model_manager.new_model_status.emit,
+            )
+        except Exception as e:
+            self.model_manager.new_model_status.emit(
+                self.tr("能谱计算失败: {err}").format(err=str(e))
+            )
+            logger.error(f"Energy spectrum error: {e}", exc_info=True)
+            return
+
+        if result:
+            self.model_manager.new_model_status.emit(
+                f"✓ 能谱计算完成: {result['plates']} 个 plate, {result['tracks']} 条轨迹 → {output_dir}"
+            )

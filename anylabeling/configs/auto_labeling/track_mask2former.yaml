@@ -1,0 +1,9 @@
+type: track_mask2former
+name: track_mask2former
+provider: Local
+display_name: Track Mask2Former (Auto Width)
+model_path: D:/desk/data/log/project/mask2former_plus/checkpoints/last_model
+plate_model_path: D:/desk/X-AnyLabeling/anylabeling/services/auto_labeling/models/plate_yolo/best.pt
+conf_threshold: 0.3
+min_track_length: 30
+keypoint_interval: 30

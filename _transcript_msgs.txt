@@ -1,0 +1,342 @@
+==== line 224 ====
+明白了 —— 在新的 `track_instance_seg` 模型里加一个**可选开关**：启用后用"过原点圆弧拟合残差"做聚类后校验（大残差 → 切分误合并的簇；参数一致 → 合并断裂的两截）。默认关闭，用户识别时自选。
+
+我确认了 `models/losses.py` 中 `ArcConsistencyLoss` 的实现（加权 LLS 拟合 $\rho = a\cos\theta + b\sin\theta$，nRMSE = RMS残差/R），可以直接移植成 numpy 后处理版本。
+
+**一个前提要说明**：圆弧拟合必须要有原点。虽然你之前选了"不保留极坐标引导聚类"，但这不冲突——聚类仍用纯 embedding DBSCAN，只是**开关打开时**额外用 heatmap 头检测原点（checkpoint 里本来就有 HeatmapHead），仅用于残差校验。若某块板子检测不到原点（peak < 0.3），该板自动跳过校验，行为与关闭开关一致。
+
+## 设计方案（在之前 4 处改动基础上追加）
+
+### ① 模型侧：`track_instance_seg.py` 增加开关与后处理
+
+```python
+class TrackInstanceSeg(Model):
+    class Meta:
+        widgets = [
+            "button_run",
+            "input_conf",
+            "edit_conf",
+            "toggle_preserve_existing_annotations",
+            "toggle_arc_residual",        # 新增：圆弧残差校验开关
+        ]
+        ...
+
+    def set_auto_labeling_arc_residual(self, enabled: bool):
+        self._arc_residual_enabled = bool(enabled)
+```
+
+核心的 numpy 拟合函数（直接从 `ArcConsistencyLoss` 移植）：
+
+```python
+def fit_arc(ys, xs, weights, origin):
+    """加权 LLS 拟合过原点圆: rho = a·cosθ + b·sinθ。
+    返回 (a, b, R, phi, nrmse)；失败返回 None。"""
+    ox, oy = origin
+    dx = xs.astype(np.float32) - ox
+    dy = ys.astype(np.float32) - oy
+    rho = np.sqrt(dx * dx + dy * dy)
+    keep = rho > 5.0                      # RHO_MIN：太靠近原点 θ 不稳定
+    if keep.sum() < 10:
+        return None
+    rho, w = rho[keep], weights[keep]
+    theta = np.arctan2(dy[keep], dx[keep])
+    c, s = np.cos(theta), np.sin(theta)
+
+    w_sum = w.sum()
+    ridge = 1e-4 * w_sum
+    M = np.array([[(w*c*c).sum() + ridge, (w*c*s).sum()],
+                  [(w*c*s).sum(), (w*s*s).sum() + ridge]])
+    v = np.array([(w*rho*c).sum(), (w*rho*s).sum()])
+    a, b = np.linalg.solve(M, v)
+    R = 0.5 * np.hypot(a, b)
+    if R < 1.0:
+        return None
+    resid = rho - a*c - b*s
+    nrmse = np.sqrt(max((w*resid*resid).sum() / w_sum, 1e-8)) / R
+    phi = np.arctan2(b, a)
+    return a, b, R, phi, nrmse
+```
+
+后处理逻辑（每块板子聚类之后执行，开关开启且检出原点时）：
+
+```python
+# 阈值参考：合成测试真弧 nrmse≈0.005，建议初始值
+SPLIT_NRMSE = 0.05      # 残差超过 → 疑似误合并，尝试切分
+MERGE_NRMSE = 0.03      # 两簇各自残差都小
+MERGE_R_TOL = 0.10      # |R1-R2|/max(R) < 10%
+MERGE_PHI_TOL = 0.15    # |φ1-φ2| < 0.15 rad
+MERGE_GAP = 40          # 端点最近距离 < 40 px
+
+def _arc_refine(self, instance_map, sem_prob, embedding, origin, pp):
+    # --- 1. 误合并切分 ---
+    for inst_id in [i for i in np.unique(instance_map) if i > 0]:
+        ys, xs = np.where(instance_map == inst_id)
+        fit = fit_arc(ys, xs, sem_prob[ys, xs], origin)
+        if fit is None or fit[4] <= SPLIT_NRMSE:
+            continue
+        # 残差过大 → 用更小 eps 对该簇单独重聚类
+        sub_emb = embedding[:, ys, xs].T
+        sub_emb /= np.clip(np.linalg.norm(sub_emb, axis=1, keepdims=True), 1e-8, None)
+        sub_labels = DBSCAN(eps=pp["dbscan_eps"] * 0.6,
+                            min_samples=pp["dbscan_min_samples"]).fit_predict(sub_emb)
+        if len(set(sub_labels) - {-1}) >= 2:   # 确实分得开才替换
+            instance_map[ys, xs] = 0
+            for k, lbl in enumerate(sorted(set(sub_labels) - {-1})):
+                sel = sub_labels == lbl
+                instance_map[ys[sel], xs[sel]] = instance_map.max() + 1
+
+    # --- 2. 断裂合并 ---
+    fits = {}
+    for inst_id in [i for i in np.unique(instance_map) if i > 0]:
+        ys, xs = np.where(instance_map == inst_id)
+        fit = fit_arc(ys, xs, sem_prob[ys, xs], origin)
+        if fit is not None and fit[4] < MERGE_NRMSE:
+            fits[inst_id] = (fit, ys, xs)
+    ids = list(fits)
+    for i, id1 in enumerate(ids):
+        for id2 in ids[i+1:]:
+            (_, _, R1, phi1, _), ys1, xs1 = fits[id1]
+            (_, _, R2, phi2, _), ys2, xs2 = fits[id2]
+            if abs(R1 - R2) / max(R1, R2) > MERGE_R_TOL:
+                continue
+            dphi = abs(phi1 - phi2)
+            if min(dphi, 2*np.pi - dphi) > MERGE_PHI_TOL:
+                continue
+            # 端点最近距离（用少量边界点近似即可）
+            if _min_endpoint_gap(ys1, xs1, ys2, xs2) < MERGE_GAP:
+                instance_map[instance_map == id2] = id1
+    return instance_map
+```
+
+原点检测复用 `infer.py` 的 `_detect_origins`（max-pool NMS，取最高峰，阈值 `heatmap_threshold=0.3`）。
+
+### ② UI 侧（3 处小改动）
+
+仿照之前给 `track_centerline` 加控件的模式：
+
+1. **`auto_labeling.ui`**：加一个 `QCheckBox`，objectName `toggle_arc_residual`，文本"圆弧残差校验"，默认不勾选
+2. **`auto_labeling.py`**：
+   - `__init__` 里连接信号：`self.toggle_arc_residual.stateChanged.connect(...)` → 发给 model_manager
+   - 隐藏控件列表（1207 行附近那个列表）加入 `"toggle_arc_residual"`
+3. **`model_manager.py`**：加透传方法，仿照 `set_auto_labeling_preserve_existing_annotations_state`：
+
+```python
+_AUTO_LABELING_ARC_RESIDUAL_MODELS = ["track_instance_seg"]
+
+def set_auto_labeling_arc_residual(self, state):
+    if (self.loaded_model_config is not None
+            and self.loaded_model_config["type"] in _AUTO_LABELING_ARC_RESIDUAL_MODELS):
+        self.loaded_model_config["model"].set_auto_labeling_arc_residual(state)
+```
+
+### 行为总结
+
+| 开关状态 | 行为 |
+|---|---|
+| 关（默认） | 纯 embedding DBSCAN → 多边形，和 `infer.py` 去掉极坐标引导后一致 |
+| 开 | 聚类后：nRMSE > 0.05 的簇用更小 eps 重聚类切分；两簇 nRMSE < 0.03 且 $(R,\varphi)$ 一致、端点相邻 < 40px 则合并 |
+
+阈值先按上面初始值写死在代码里（常量放文件顶部方便调），跑几张图验证后再决定要不要暴露到 UI。
+
+我目前在 Ask（只读）模式，无法写文件——切到 Agent 模式说一声"开始实现
+
+==== line 228 ====
+好——把圆弧残差校验的阈值做成可调的。更新后的设计如下：
+
+## 阈值分两层调控
+
+**第一层：YAML 配置（全部 5 个阈值可调，改配置文件即生效）**
+
+`track_instance_seg.yaml` 增加：
+
+```yaml
+type: track_instance_seg
+name: track_instance_seg
+provider: Local
+display_name: Track Instance Segmentation
+model_path: D:/desk/data/log/project/checkpoints/best_model.pth
+plate_model_path: D:/desk/data/log/project/data_seg_yolo/runs/plate_yolov8n/weights/best.pt
+conf_threshold: 0.5
+# --- 圆弧残差校验（开关默认关） ---
+arc_residual:
+  split_nrmse: 0.05      # 簇残差 > 此值 → 疑似误合并，尝试切分
+  merge_nrmse: 0.03      # 两簇残差均 < 此值才考虑合并
+  merge_r_tol: 0.10      # |R1-R2|/max(R) 容差
+  merge_phi_tol: 0.15    # |φ1-φ2| 容差（弧度）
+  merge_gap: 40          # 端点最近距离（px）
+```
+
+**第二层：UI 实时调控（暴露两个最关键的阈值）**
+
+界面上加控件太多会很挤，所以 UI 只暴露日常最需要调的两个，其余用 YAML：
+
+| 控件 | objectName | 范围/步长 | 默认 |
+|---|---|---|---|
+| 复选框「圆弧残差校验」 | `toggle_arc_residual` | — | 关 |
+| 「切分阈值」QDoubleSpinBox | `edit_arc_split_nrmse` | 0.005–0.50，步长 0.005 | 0.05 |
+| 「合并阈值」QDoubleSpinBox | `edit_arc_merge_nrmse` | 0.005–0.50，步长 0.005 | 0.03 |
+
+两个 SpinBox 跟随复选框显隐（勾选才显示，仿照 `track_centerline` 的带状控件交互）。
+
+## 代码接线（在上一轮方案基础上的增量）
+
+**① `track_instance_seg.py`** —— 阈值从 config 读默认值，UI 可覆盖：
+
+```python
+class TrackInstanceSeg(Model):
+    class Meta:
+        widgets = [
+            "button_run",
+            "input_conf",
+            "edit_conf",
+            "toggle_preserve_existing_annotations",
+            "toggle_arc_residual",
+            "edit_arc_split_nrmse",
+            "edit_arc_merge_nrmse",
+        ]
+        ...
+
+    def __init__(self, model_config, on_message):
+        ...
+        arc_cfg = self.config.get("arc_residual", {})
+        self._arc_enabled = False
+        self._split_nrmse = arc_cfg.get("split_nrmse", 0.05)
+        self._merge_nrmse = arc_cfg.get("merge_nrmse", 0.03)
+        self._merge_r_tol = arc_cfg.get("merge_r_tol", 0.10)
+        self._merge_phi_tol = arc_cfg.get("merge_phi_tol", 0.15)
+        self._merge_gap = arc_cfg.get("merge_gap", 40)
+
+    # --- UI 回调 ---
+    def set_auto_labeling_arc_residual(self, enabled):
+        self._arc_enabled = bool(enabled)
+
+    def set_auto_labeling_arc_split_nrmse(self, value):
+        if value > 0:
+            self._split_nrmse = float(value)
+
+    def set_auto_labeling_arc_merge_nrmse(self, value):
+        if value > 0:
+            self._merge_nrmse = float(value)
+```
+
+`_arc_refine()` 内部全部改用 `self._split_nrmse` 等实例属性，不再用模块级常量。
+
+**② `model_manager.py`** —— 三个透传方法：
+
+```python
+_AUTO_LABELING_ARC_RESIDUAL_MODELS = ["track_instance_seg"]
+
+def set_auto_labeling_arc_residual(self, state):
+    if (self.loaded_model_config is not None
+            and self.loaded_model_config["type"] in _AUTO_LABELING_ARC_RESIDUAL_MODELS):
+        self.loaded_model_config["model"].set_auto_labeling_arc_residual(state)
+
+def set_auto_labeling_arc_split_nrmse(self, value): ...   # 同模式
+def set_auto_labeling_arc_merge_nrmse(self, value): ...   # 同模式
+```
+
+**③ `auto_labeling.ui` + `auto_labeling.py`**：
+
+- `.ui` 里加一行水平布局：`QCheckBox`(toggle_arc_residual) + `QLabel`("切分阈值") + `QDoubleSpinBox`(edit_arc_split_nrmse) + `QLabel`("合并阈值") + `QDoubleSpinBox`(edit_arc_merge_nrmse)
+- `auto_labeling.py`：
+  - 信号连接：`stateChanged` / `valueChanged` → model_manager 对应方法
+  - 复选框切换时 `setVisible()` 控制两个 SpinBox 显隐
+  - 第 1207 行附近的隐藏控件列表加入这 3 个 objectName
+
+## 调参建议
+
+跑图时的调法：
+- **切多了**（一条轨迹被拆碎）→ 调大切分阈值（如 0.05 → 0.10）
+- **该拆没拆**（两条轨迹粘一起）→ 调小切分阈值
+- **该合没合**（断裂轨迹没接上）→ 调大合并阈值或 YAML 里的 `merge_gap`
+- 参考基准：真弧的 nRMSE ≈ 0.005，所以合并阈值别超过 0.05 太多，否则会把不同弧误判为同一条
+
+方案已完整（配置 + 模型文件 + model_manager + UI 四处）。我在 Ask 模式下不能写文件——切到 Agent 模式后我可以按此方案直接实现。
+
+==== line 232 ====
+好，那推理流程就与 `infer.py` **完全一致**了：原点检测保留、极坐标引导聚类保留，并且原点也作为标注输出。最终方案汇总如下：
+
+## 完整 pipeline（每张图）
+
+1. YOLO 检测板子（权重缺失时回退 CV 检测 / 整图）
+2. 每块板子扩展到 32 倍数 → 裁剪 → 单次前向 → `sem_prob + embedding + hm_prob`
+3. **原点检测**：max-pool NMS 峰值检测（阈值/kernel 用 checkpoint cfg 的 `heatmap_threshold`、`peak_nms_kernel`），每板最多 1 个
+4. **极坐标引导 DBSCAN**：检出原点时用 `augment_embedding`（cos/sin 角度通道，`polar_alpha`/`polar_beta` 从 checkpoint cfg 读），未检出则退化为纯 embedding 聚类
+5. `_cleanup_small` 去小组件
+6. （开关开启时）圆弧残差校验：切分/合并，阈值可调
+7. 坐标平移回全图 → 输出标注
+
+## 输出的标注 Shape
+
+| 内容 | shape_type | label |
+|---|---|---|
+| 每条轨迹实例掩码轮廓（`cv2.findContours` + `approxPolyDP`） | `polygon` | `track_1`, `track_2`, … |
+| 每块板子的原点 | `point` | `origin` |
+
+对应 `Meta`：
+
+```python
+output_modes = {
+    "polygon": QCoreApplication.translate("Model", "Polygon"),
+    "point": QCoreApplication.translate("Model", "Point"),
+}
+default_output_mode = "polygon"
+```
+
+原点 Shape 生成（在 `predict_shapes` 里，紧跟每板处理）：
+
+```python
+for ox, oy, score in origins:      # 已平移回全图坐标
+    pt = Shape(label="origin", shape_type="point", flags={})
+    pt.add_point(QtCore.QPointF(ox + ex, oy + ey))
+    pt.other_data["score"] = round(score, 4)
+    shapes.append(pt)
+```
+
+## 配置文件（最终版）
+
+`anylabeling/configs/auto_labeling/track_instance_seg.yaml`：
+
+```yaml
+type: track_instance_seg
+name: track_instance_seg
+provider: Local
+display_name: Track Instance Segmentation
+model_path: D:/desk/data/log/project/checkpoints/best_model.pth
+plate_model_path: D:/desk/data/log/project/data_seg_yolo/runs/plate_yolov8n/weights/best.pt
+conf_threshold: 0.5          # 语义二值化阈值（UI 置信度滑块可覆盖）
+# --- 圆弧残差校验（UI 开关控制，默认关） ---
+arc_residual:
+  split_nrmse: 0.05
+  merge_nrmse: 0.03
+  merge_r_tol: 0.10
+  merge_phi_tol: 0.15
+  merge_gap: 40
+```
+
+> 极坐标聚类参数（`polar_alpha=0.25` 等）、DBSCAN 参数、原点检测阈值都直接从 checkpoint 内嵌的 `cfg["postprocess"]` 读取，与 `infer.py` 保持同源，不必在 YAML 里重复。
+
+## UI 控件（最终清单）
+
+| 控件 | 作用 | 默认 |
+|---|---|---|
+| `button_run` | 运行 | — |
+| `input_conf` / `edit_conf` | 语义阈值滑块（内置标准控件） | 0.5 |
+| `toggle_preserve_existing_annotations` | 保留已有标注（内置标准控件） | — |
+| `toggle_arc_residual` | 圆弧残差校验开关（新增） | 关 |
+| `edit_arc_split_nrmse` | 切分阈值（新增，勾选后显示） | 0.05 |
+| `edit_arc_merge_nrmse` | 合并阈值（新增，勾选后显示） | 0.03 |
+
+## 改动文件清单（共 6 处）
+
+1. **新建** `anylabeling/configs/auto_labeling/track_instance_seg.yaml`
+2. **追加** `anylabeling/configs/models.yaml` 注册条目
+3. **新建** `anylabeling/services/auto_labeling/track_instance_seg.py`（内联 TrackSegModel 三头结构 + `find_plates_yolo`/CV 回退 + `expand_box_to_multiple` + `augment_embedding` + 极坐标 DBSCAN + `_detect_origins` + `_arc_refine` + 多边形/原点 Shape 输出）
+4. **修改** `anylabeling/services/auto_labeling/model_manager.py`（注册 `track_instance_seg` 类型加载 + 3 个阈值/开关透传方法）
+5. **修改** `anylabeling/views/labeling/widgets/auto_labeling/auto_labeling.ui`（新增 1 个复选框 + 2 个 QDoubleSpinBox）
+6. **修改** `anylabeling/views/labeling/widgets/auto_labeling/auto_labeling.py`（信号连接、显隐逻辑、隐藏控件列表）
+
+一个注意点：板子 YOLO 检测需要 `ultralytics` 包，X-AnyLabeling 环境里如果没装会走 CV 回退——实现时我会把 YOLO 导入放在 try/except 里并打日志提示，行为与 `find_plates` 的回退逻辑一致。
+
+方案已定稿。我现在处于 Ask（只读）模式无法写文件——请切换到 **Agent 模式**，我就按这 6 处改动直接实现。
+
