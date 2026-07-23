@@ -243,6 +243,27 @@ def _skeletonize(mask):
     mask = mask.astype(np.uint8)
     if mask.sum() < 5:
         return np.zeros_like(mask, dtype=np.uint8)
+
+    # 1️⃣ 首选：真正的 medial_axis（中轴变换），按距离阈值去毛刺
+    try:
+        from skimage.morphology import medial_axis
+        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+        skel = medial_axis(mask.astype(bool), return_distance=False).astype(np.uint8)
+        skel = skel & (dist > dist.max() * 0.3)  # 裁掉距离边界太近的侧枝
+        if skel.sum() >= 3:
+            return skel
+    except ImportError:
+        pass
+
+    # 2️⃣ 次选：cv2.ximgproc.thinning（Guo-Hall 并行细化）
+    try:
+        skel = cv2.ximgproc.thinning(mask)
+        if skel is not None and skel.sum() >= 3:
+            return skel
+    except (AttributeError, cv2.error):
+        pass
+
+    # 3️⃣ 再次：skimage Zhang-Suen
     try:
         import skimage.morphology as skmorph
         skel = skmorph.skeletonize(mask.astype(bool)).astype(np.uint8)
@@ -250,6 +271,8 @@ def _skeletonize(mask):
             return skel
     except ImportError:
         pass
+
+    # 4️⃣ 兜底：距离变换脊线
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     local_max = cv2.dilate(dist, np.ones((3, 3))) == dist
     skel = (local_max & (dist > dist.max() * 0.3)).astype(np.uint8) & mask
@@ -330,7 +353,22 @@ def mask_to_ribbon(mask, keypoint_interval=30.0):
     if len(endpoints) < 2:
         endpoints = [tuple(pts[0]), tuple(pts[-1])]
 
-    path = _dijkstra_path(skel, endpoints[0], endpoints[-1])
+    # 选取距离最远的两个端点（避免骨架分支导致 Dijkstra 走侧枝再折返）
+    if len(endpoints) > 2:
+        max_d2 = -1
+        best_a, best_b = endpoints[0], endpoints[-1]
+        for i in range(len(endpoints)):
+            for j in range(i + 1, len(endpoints)):
+                d2 = (endpoints[i][0] - endpoints[j][0]) ** 2 + \
+                     (endpoints[i][1] - endpoints[j][1]) ** 2
+                if d2 > max_d2:
+                    max_d2 = d2
+                    best_a, best_b = endpoints[i], endpoints[j]
+        start, end = best_a, best_b
+    else:
+        start, end = endpoints[0], endpoints[-1]
+
+    path = _dijkstra_path(skel, start, end)
     if path is None or len(path) < 3:
         order = np.argsort(pts[:, 1]) if h > w else np.argsort(pts[:, 0])
         path = [(int(pts[i, 0]), int(pts[i, 1])) for i in order]
