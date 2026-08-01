@@ -11,6 +11,7 @@ Per-track width adjustment (click polygon → slider) is preserved.
 """
 import os
 import gc
+import heapq
 import traceback
 from pathlib import Path
 from typing import List, Tuple
@@ -240,30 +241,10 @@ def find_plates(image, model_path, conf=0.25, iou=0.5, min_area_ratio=0.005):
 # ======================================================================
 
 def _skeletonize(mask):
+    """骨架化：scikit-image > cv2.ximgproc > 距离变换脊线 > 距离变换阈值"""
     mask = mask.astype(np.uint8)
     if mask.sum() < 5:
         return np.zeros_like(mask, dtype=np.uint8)
-
-    # 1️⃣ 首选：真正的 medial_axis（中轴变换），按距离阈值去毛刺
-    try:
-        from skimage.morphology import medial_axis
-        dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-        skel = medial_axis(mask.astype(bool), return_distance=False).astype(np.uint8)
-        skel = skel & (dist > dist.max() * 0.3)  # 裁掉距离边界太近的侧枝
-        if skel.sum() >= 3:
-            return skel
-    except ImportError:
-        pass
-
-    # 2️⃣ 次选：cv2.ximgproc.thinning（Guo-Hall 并行细化）
-    try:
-        skel = cv2.ximgproc.thinning(mask)
-        if skel is not None and skel.sum() >= 3:
-            return skel
-    except (AttributeError, cv2.error):
-        pass
-
-    # 3️⃣ 再次：skimage Zhang-Suen
     try:
         import skimage.morphology as skmorph
         skel = skmorph.skeletonize(mask.astype(bool)).astype(np.uint8)
@@ -271,11 +252,15 @@ def _skeletonize(mask):
             return skel
     except ImportError:
         pass
-
-    # 4️⃣ 兜底：距离变换脊线
+    try:
+        skel = cv2.ximgproc.thinning(mask)
+        if skel is not None and skel.sum() >= 3:
+            return skel
+    except (AttributeError, cv2.error):
+        pass
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     local_max = cv2.dilate(dist, np.ones((3, 3))) == dist
-    skel = (local_max & (dist > dist.max() * 0.3)).astype(np.uint8) & mask
+    skel = (local_max & (dist > dist.max() * 0.1)).astype(np.uint8) & mask
     if skel.sum() < 3:
         skel = (dist >= dist.max() * 0.7).astype(np.uint8) & mask
     return skel
@@ -294,7 +279,6 @@ def _neighbors_8(y, x, h, w, skel):
 
 
 def _dijkstra_path(skel, start, end):
-    import heapq
     h, w = skel.shape
     pq = [(0.0, start, [start])]
     best = {start: 0.0}
@@ -331,71 +315,362 @@ def _smooth_path(pts, sigma=1.5):
     return np.stack([y_sm, x_sm], axis=1)
 
 
-def mask_to_ribbon(mask, keypoint_interval=30.0):
-    """mask → centerline + auto half_width → list of (x, y) centerline points + half_width."""
+def centerline_to_ribbon(centerline, track_width):
+    """从中心线 + 宽度直接计算 ribbon 多边形（法向量偏移法）。
+
+    与 mask_to_ribbon 中的 ribbon 计算逻辑完全一致，但跳过了骨架化步骤。
+    用于手动绘制的 track（已有精确中心线）。
+
+    Args:
+        centerline: [(x, y), ...] 中心线折点列表，图像坐标
+        track_width: int 完整宽度（像素）
+
+    Returns:
+        ribbon: [(x, y), ...] ribbon 多边形顶点列表
+    """
+    half_width = track_width / 2.0
+    n = len(centerline)
+    if n < 2:
+        return []
+
+    # (y, x) 格式用于法向量计算
+    pts = np.array([(y, x) for x, y in centerline], dtype=np.float64)
+    left, right = [], []
+    for i in range(n):
+        y, x = pts[i]
+        if i == 0:
+            dy, dx = pts[1][0] - y, pts[1][1] - x
+        elif i == n - 1:
+            dy, dx = y - pts[-2][0], x - pts[-2][1]
+        else:
+            dy = pts[i + 1][0] - pts[i - 1][0]
+            dx = pts[i + 1][1] - pts[i - 1][1]
+        norm = max(np.sqrt(dx * dx + dy * dy), 1e-6)
+        nx, ny = -dy / norm, dx / norm
+
+        if i == 0 or i == n - 1:
+            ny = 0.0
+            nx = 1.0 if nx > 0 else -1.0
+
+        left.append((float(x + nx * half_width), float(y + ny * half_width)))
+        right.append((float(x - nx * half_width), float(y - ny * half_width)))
+
+    return left + list(reversed(right))
+
+
+def centerline_to_ribbon_mask(centerline, track_width, H, W):
+    """从中心线 + 宽度直接生成 ribbon 填充 mask（避免 polylines→骨架化的绕路）。
+
+    Args:
+        centerline: [(x, y), ...] 中心线折点列表
+        track_width: int 完整宽度（像素）
+        H, W: int 图像尺寸
+
+    Returns:
+        mask: (H, W) uint8 二值 mask
+    """
+    ribbon = centerline_to_ribbon(centerline, track_width)
+    mask = np.zeros((H, W), dtype=np.uint8)
+    if ribbon and len(ribbon) >= 3:
+        cv2.fillPoly(mask, [np.array(ribbon, dtype=np.int32)], 1)
+    return mask
+
+
+def _offset_centerline(centerline, offset):
+    """Offset each point of a centerline along its normal direction.
+
+    Args:
+        centerline: [(x, y), ...]
+        offset: float, positive = right side, negative = left side
+
+    Returns:
+        [(x, y), ...]
+    """
+    n = len(centerline)
+    result = []
+    for i in range(n):
+        cx, cy = centerline[i]
+        if i == 0:
+            dx = centerline[1][0] - cx
+            dy = centerline[1][1] - cy
+        elif i == n - 1:
+            dx = cx - centerline[-2][0]
+            dy = cy - centerline[-2][1]
+        else:
+            dx = centerline[i + 1][0] - centerline[i - 1][0]
+            dy = centerline[i + 1][1] - centerline[i - 1][1]
+        length = (dx * dx + dy * dy) ** 0.5
+        if length < 1e-6:
+            result.append((cx, cy))
+            continue
+        nx, ny = -dy / length, dx / length
+        # Force horizontal at endpoints
+        if i == 0 or i == n - 1:
+            ny = 0.0
+            nx = 1.0 if nx > 0 else -1.0
+        result.append((cx + nx * offset, cy + ny * offset))
+    return result
+
+
+def _extend_centerline_y(centerline, y_min, y_max):
+    """Extend the first/last point along the tangent so the centerline's
+    Y range covers [y_min, y_max].
+
+    Args:
+        centerline: [(x, y), ...]
+        y_min, y_max: target Y range
+
+    Returns:
+        [(x, y), ...] with extended endpoints
+    """
+    if len(centerline) < 2:
+        return centerline
+    cl = list(centerline)
+
+    # Extend start point backwards
+    dx = cl[1][0] - cl[0][0]
+    dy = cl[1][1] - cl[0][1]
+    length = (dx * dx + dy * dy) ** 0.5
+    if length > 1e-6 and abs(dy) > 1e-6:
+        tx, ty = dx / length, dy / length
+        t = (cl[0][1] - y_min) / ty
+        if abs(t) > 1e-6:
+            cl[0] = (cl[0][0] - t * tx, cl[0][1] - t * ty)
+
+    # Extend end point forward
+    dx = cl[-1][0] - cl[-2][0]
+    dy = cl[-1][1] - cl[-2][1]
+    length = (dx * dx + dy * dy) ** 0.5
+    if length > 1e-6 and abs(dy) > 1e-6:
+        tx, ty = dx / length, dy / length
+        t = (y_max - cl[-1][1]) / ty
+        if abs(t) > 1e-6:
+            cl[-1] = (cl[-1][0] + t * tx, cl[-1][1] + t * ty)
+
+    return cl
+
+
+def mask_to_ribbon(mask, keypoint_interval=30.0, other_masks=None,
+                   force_bg_side: float = 0.0):
+    """实例分割 mask → 中心线 + 半宽 → ribbon 多边形 + 背景条带
+
+    Args:
+        mask: (H, W) uint8 binary mask of this track
+        keypoint_interval: 中心线上关键点的像素间距
+        other_masks: (H, W) uint8 combined mask of *other* instances in the same plate.
+                     用来裁切背景条带，保证bg不碰到其他轨迹。
+        force_bg_side: +1 强制右侧, -1 强制左侧, 0 自动选最佳侧
+    Returns:
+        ribbon: [(x, y), ...] 带状多边形顶点列表, 或空列表
+        centerline: [(x, y), ...] 中心线关键点折线, 或空列表
+        half_width: float 半宽（像素）
+        bg_polygon: [(x, y), ...] 背景条带多边形顶点列表, 或空列表
+        bg_gap: float 背景条带与轨迹之间的安全间距（像素）
+        bg_side: float +1 或 -1，背景条带在哪一侧；无背景时为 0
+    """
     h, w = mask.shape
     mask = mask.astype(np.uint8)
     if mask.sum() < 10:
-        return [], 0.0
+        return [], [], 0.0, [], max(5.0, 3.0), 0.0
 
+    # 1. 骨架化
     skel = _skeletonize(mask)
 
+    # 2. 计算半宽（距离变换 + 骨架上的中位数）
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     vals = dist[skel > 0]
     half_width = float(np.median(vals)) if len(vals) > 0 else 3.0
-    half_width = max(half_width, 1.0)
 
+    # 3. 骨架 → 关键点路径
     pts = np.column_stack(np.where(skel > 0))
     if len(pts) < 2:
-        return [], half_width
+        return [], [], half_width, [], max(5.0, half_width), 0.0
 
-    endpoints = [(int(y), int(x)) for y, x in pts if _neighbors_8(y, x, h, w, skel) == 1]
+    # 找端点 (8邻域只有1个邻居的点)
+    endpoints = [(int(y), int(x)) for y, x in pts
+                 if _neighbors_8(y, x, h, w, skel) == 1]
     if len(endpoints) < 2:
         endpoints = [tuple(pts[0]), tuple(pts[-1])]
 
-    # 选取距离最远的两个端点（避免骨架分支导致 Dijkstra 走侧枝再折返）
-    if len(endpoints) > 2:
-        max_d2 = -1
-        best_a, best_b = endpoints[0], endpoints[-1]
-        for i in range(len(endpoints)):
-            for j in range(i + 1, len(endpoints)):
-                d2 = (endpoints[i][0] - endpoints[j][0]) ** 2 + \
-                     (endpoints[i][1] - endpoints[j][1]) ** 2
-                if d2 > max_d2:
-                    max_d2 = d2
-                    best_a, best_b = endpoints[i], endpoints[j]
-        start, end = best_a, best_b
-    else:
-        start, end = endpoints[0], endpoints[-1]
-
-    path = _dijkstra_path(skel, start, end)
+    # Dijkstra 最短路径
+    path = _dijkstra_path(skel, endpoints[0], endpoints[-1])
     if path is None or len(path) < 3:
         order = np.argsort(pts[:, 1]) if h > w else np.argsort(pts[:, 0])
         path = [(int(pts[i, 0]), int(pts[i, 1])) for i in order]
 
+    # 移除路径中的 Y 回退段，防止中心线回环（轨迹始终竖向，Y 单调递增）
+    mono = [path[0]]
+    for p in path[1:]:
+        if p[0] >= mono[-1][0]:
+            mono.append(p)
+    if len(mono) >= 3:
+        path = mono
+    elif path[0][0] > path[-1][0]:
+        path = list(reversed(path))
+
+    # 4. 按像素间距采样关键点 → 中心线折线
     path_arr = np.array(path, dtype=np.float64)
     dists = np.zeros(len(path_arr))
     for j in range(1, len(path_arr)):
-        dists[j] = dists[j - 1] + np.linalg.norm(path_arr[j] - path_arr[j - 1])
+        dists[j] = dists[j-1] + np.linalg.norm(path_arr[j] - path_arr[j-1])
     total_len = dists[-1]
     n_samples = max(2, int(total_len / keypoint_interval) + 1)
     targets = np.linspace(0, total_len, n_samples)
     indices = np.searchsorted(dists, targets)
     indices = np.clip(indices, 0, len(path_arr) - 1)
     indices = np.unique(indices)
+    # 确保包含首尾端点
     if indices[0] != 0:
         indices = np.concatenate([[0], indices])
     if indices[-1] != len(path_arr) - 1:
         indices = np.concatenate([indices, [len(path_arr) - 1]])
     keypoints_yx = path_arr[indices]
+    if len(keypoints_yx) < 2:
+        return [], [], half_width, [], max(5.0, half_width), 0.0
 
+    # 平滑
     if len(keypoints_yx) >= 5:
         keypoints_yx = _smooth_path(keypoints_yx, sigma=1.5)
     keypoints_yx[0] = path[0]
     keypoints_yx[-1] = path[-1]
 
+    # 确保中心线从上到下 (Y 递增)；若反了则整体反转
+    if keypoints_yx[-1][0] < keypoints_yx[0][0]:
+        keypoints_yx = keypoints_yx[::-1]
+
+    # 中心线: (y, x) → [(x, y), ...]
     centerline = [(float(x), float(y)) for y, x in keypoints_yx]
-    return centerline, half_width
+
+    # 5. 中心线 + 法向量方向 ± 半宽 → ribbon
+    n = len(keypoints_yx)
+    left, right = [], []
+    for i in range(n):
+        y, x = keypoints_yx[i]
+        if i == 0:
+            dy, dx = keypoints_yx[1][0] - y, keypoints_yx[1][1] - x
+        elif i == n - 1:
+            dy, dx = y - keypoints_yx[-2][0], x - keypoints_yx[-2][1]
+        else:
+            dy = keypoints_yx[i + 1][0] - keypoints_yx[i - 1][0]
+            dx = keypoints_yx[i + 1][1] - keypoints_yx[i - 1][1]
+        norm = max(np.sqrt(dx * dx + dy * dy), 1e-6)
+        nx, ny = -dy / norm, dx / norm
+
+        # 端点强制水平 ny=0
+        if i == 0 or i == n - 1:
+            ny = 0.0
+            nx = 1.0 if nx > 0 else -1.0
+
+        left.append((float(x + nx * half_width), float(y + ny * half_width)))
+        right.append((float(x - nx * half_width), float(y - ny * half_width)))
+
+    ribbon = left + list(reversed(right))
+
+    # 6. Background strip — same width as track, with a gap so no track pixels
+    #    are included.  The background polygon is generated by offsetting the
+    #    track centerline along the normal direction (exactly the same way the
+    #    track ribbon is built), so its width is identical to the track width.
+    #    A filled mask is still used to decide which side is better and to
+    #    detect overlap with other tracks, but the final polygon comes from the
+    #    offset points (not from findContours), guaranteeing width consistency.
+    bg_polygon = []
+    bg_hw = max(1.0, half_width)                   # 与轨迹等宽（不再 -1）
+    bg_gap = max(30.0, half_width)                   # safety gap (px)
+    bg_offset = half_width + bg_gap + bg_hw         # centerline → bg center distance
+
+    # Mask to avoid: other instances in the same plate (not this track itself)
+    avoid = other_masks if other_masks is not None else np.zeros_like(mask)
+
+    best_bg = None
+    best_bg_side = 0.0
+    best_bg_length = 0.0
+
+    # Unit vector of the centerline's principal direction (for length projection)
+    cl_pts = np.array(keypoints_yx)  # (n, 2) [y, x]
+    cl_vec = cl_pts[-1] - cl_pts[0]
+    cl_len = float(np.linalg.norm(cl_vec))
+    cl_dir = cl_vec / cl_len if cl_len >= 1 else np.array([0.0, 1.0])
+
+    sides_to_try = [force_bg_side] if abs(force_bg_side) > 0.001 else [+1.0, -1.0]
+
+    for sign in sides_to_try:
+        bg_left, bg_right = [], []
+        for i in range(n):
+            y, x = keypoints_yx[i]
+            if i == 0:
+                dy, dx = keypoints_yx[1][0] - y, keypoints_yx[1][1] - x
+            elif i == n - 1:
+                dy, dx = y - keypoints_yx[-2][0], x - keypoints_yx[-2][1]
+            else:
+                dy = keypoints_yx[i + 1][0] - keypoints_yx[i - 1][0]
+                dx = keypoints_yx[i + 1][1] - keypoints_yx[i - 1][1]
+            norm = max(np.sqrt(dx * dx + dy * dy), 1e-6)
+            nx, ny = -dy / norm, dx / norm
+
+            # 端点强制水平 ny=0（与 track ribbon 一致）
+            if i == 0 or i == n - 1:
+                ny = 0.0
+                nx = 1.0 if nx > 0 else -1.0
+
+            bg_cx = x + sign * nx * bg_offset
+            bg_cy = y + sign * ny * bg_offset
+            bg_left.append((float(bg_cx + nx * bg_hw), float(bg_cy + ny * bg_hw)))
+            bg_right.append((float(bg_cx - nx * bg_hw), float(bg_cy - ny * bg_hw)))
+
+        bg_poly = np.array(bg_left + list(reversed(bg_right)), dtype=np.float64)
+        if len(bg_poly) < 6:
+            continue
+
+        bg_mask_side = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(bg_mask_side, [bg_poly.astype(np.int32)], 1)
+
+        # 删除与*其他*轨迹像素重叠的行 → 可能截断成多段
+        overlap = (avoid > 0) & (bg_mask_side > 0)
+        bad_rows = np.unique(np.where(overlap)[0])
+        for r in bad_rows:
+            bg_mask_side[r, :] = 0
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            bg_mask_side, connectivity=8)
+        if num_labels > 1:
+            for lbl in range(1, num_labels):
+                comp_mask = (labels == lbl).astype(np.uint8)
+                ys, xs = np.where(comp_mask)
+                if len(ys) < 10:
+                    continue
+                # 沿中心线方向的投影长度
+                dots = ys * cl_dir[0] + xs * cl_dir[1]
+                proj_len = float(dots.max() - dots.min())
+                if proj_len > best_bg_length:
+                    best_bg_length = proj_len
+                    best_bg_side = sign
+                    # 直接用偏移点作为背景多边形（与轨迹 ribbon 同方式生成，
+                    # 宽度严格等于 half_width，不依赖 findContours 轮廓）
+                    best_bg = [[float(p[0]), float(p[1])] for p in bg_poly]
+
+    if best_bg is not None:
+        # 让背景多边形的 Y 范围严格覆盖对应轨迹的 Y 范围。
+        # 轨迹 ribbon 端点 ny=0，故其 Y 范围 = 中心线端点 Y 范围；
+        # 而轨迹 mask 的 Y 范围（track_y_min~track_y_max）因 mask 有宽度会略大。
+        # 这里把背景多边形整体平移并拉伸 Y，使其 Y 范围与轨迹 mask 完全一致，
+        # X 方向保持不变（宽度由法向偏移保证）。
+        track_ys = np.where(mask > 0)[0]
+        if len(track_ys) > 0:
+            track_y_min = float(track_ys.min())
+            track_y_max = float(track_ys.max())
+            bg_arr = np.array(best_bg, dtype=np.float64)  # (N, 2) [x, y]
+            bg_y_min = bg_arr[:, 1].min()
+            bg_y_max = bg_arr[:, 1].max()
+            if bg_y_max - bg_y_min > 1.0:
+                # 平移 + 拉伸 Y 到轨迹的 Y 范围（仅 Y，不影响宽度）
+                ratio = (track_y_max - track_y_min) / (bg_y_max - bg_y_min)
+                bg_arr[:, 1] = track_y_min + (bg_arr[:, 1] - bg_y_min) * ratio
+            else:
+                bg_arr[:, 1] = (track_y_min + track_y_max) / 2.0
+            best_bg = [[float(p[0]), float(p[1])] for p in bg_arr]
+        bg_polygon = best_bg
+
+    return ribbon, centerline, half_width, bg_polygon, bg_gap, best_bg_side
 
 
 # ======================================================================
@@ -403,8 +678,16 @@ def mask_to_ribbon(mask, keypoint_interval=30.0):
 # ======================================================================
 
 def _adapt_first_conv_to_grayscale(model):
+    """Replace Swin patch embedding's first conv: 3→1 input channel.
+
+    Works with both SwinModel (embeddings.patch_embeddings) and
+    SwinBackbone (swin.embeddings.patch_embeddings).
+    """
     import torch.nn as nn
-    emb = model.model.pixel_level_module.encoder.embeddings.patch_embeddings
+    encoder = model.model.pixel_level_module.encoder
+    # SwinBackbone wraps a SwinModel in .swin, SwinModel has it directly
+    root = getattr(encoder, "swin", encoder)
+    emb = root.embeddings.patch_embeddings
     old_conv = emb.projection
     if old_conv.in_channels == 1:
         return
@@ -417,7 +700,8 @@ def _adapt_first_conv_to_grayscale(model):
     if old_conv.bias is not None:
         new_conv.bias.data = old_conv.bias.data
     emb.projection = new_conv
-    emb.num_channels = 1
+    if hasattr(emb, "num_channels"):
+        emb.num_channels = 1
 
 
 def _imread_unicode(path: str) -> np.ndarray:
@@ -505,7 +789,8 @@ class TrackMask2Former(Model):
             "edit_track_width",
             "input_track_width",
             "button_toggle_band",
-            "button_energy_spectrum",
+            "button_detect_plates",
+            "button_draw_background",
         ]
         output_modes = {
             "polygon": QCoreApplication.translate("Model", "Polygon"),
@@ -524,6 +809,8 @@ class TrackMask2Former(Model):
             )
 
         self.plate_model_path = self.config.get("plate_model_path", "")
+        if self.plate_model_path:
+            self.plate_model_path = os.path.abspath(self.plate_model_path)
         if not self.plate_model_path or not os.path.isfile(self.plate_model_path):
             raise FileNotFoundError(
                 QCoreApplication.translate(
@@ -547,27 +834,52 @@ class TrackMask2Former(Model):
             Mask2FormerForUniversalSegmentation,
             Mask2FormerConfig,
         )
-        config = Mask2FormerConfig.from_pretrained(
+        self.model = Mask2FormerForUniversalSegmentation.from_pretrained(
             str(self.model_abs_path),
+            num_labels=2,
+            ignore_mismatched_sizes=True,
             local_files_only=True,
         )
-        self.model = Mask2FormerForUniversalSegmentation(config)
         _adapt_first_conv_to_grayscale(self.model)
 
+        # from_pretrained 已加载所有权重，只需手动覆盖 1ch conv
+        # （_adapt_first_conv_to_grayscale 用均值初始化了 1ch conv，
+        #   需要用 checkpoint 中训练好的 1ch conv 权重覆盖它）
         state_path = Path(self.model_abs_path) / "model.safetensors"
         if not state_path.is_file():
             raise FileNotFoundError(
                 f"Checkpoint not found: {state_path}"
             )
-        try:
-            from safetensors.torch import load_file as safe_load
-            state_dict = safe_load(str(state_path))
-        except ImportError:
-            state_dict = torch.load(str(state_path), map_location="cpu",
-                                    weights_only=True)
-        self.model.load_state_dict(state_dict, strict=False)
+        from transformers.modeling_utils import load_state_dict
+        ckpt = load_state_dict(str(state_path))
+
+        encoder = self.model.model.pixel_level_module.encoder
+        root = getattr(encoder, "swin", encoder)
+        proj = root.embeddings.patch_embeddings.projection
+
+        ckpt_proj_key = None
+        for k in ckpt:
+            if "patch_embeddings.projection.weight" in k:
+                ckpt_proj_key = k
+                break
+
+        if ckpt_proj_key and proj.in_channels == 1:
+            proj.weight.data = ckpt[ckpt_proj_key]
+            ckpt_bias_key = ckpt_proj_key.replace(".weight", ".bias")
+            if ckpt_bias_key in ckpt and proj.bias is not None:
+                proj.bias.data = ckpt[ckpt_bias_key]
+
         self.model = self.model.to(self.device)
         self.model.eval()
+
+        # --- 验证 1ch conv 权重 ---
+        proj_weight_ckpt = ckpt.get(ckpt_proj_key) if ckpt_proj_key else None
+        if proj_weight_ckpt is not None:
+            loaded = root.embeddings.patch_embeddings.projection.weight.data
+            match = torch.allclose(loaded, proj_weight_ckpt.to(loaded.device))
+            print(f"[Mask2Former] 1ch conv weight: {'MATCHED' if match else 'MISMATCHED'}")
+        # ----------------------------------------------------------------
+
         self.on_message("Mask2Former model loaded.")
 
     def set_auto_labeling_preserve_existing_annotations_state(self, state):
@@ -604,6 +916,33 @@ class TrackMask2Former(Model):
 
         # Stage 1: detect plates
         plates = find_plates(image_rgb, self.plate_model_path)
+
+        # Merge overlapping or tightly adjacent plates
+        if len(plates) > 1:
+            plates = sorted(plates, key=lambda b: b[0])
+            merged = []
+            cur_x, cur_y, cur_w, cur_h = plates[0]
+            for px, py, pw, ph in plates[1:]:
+                overlap_x = max(0, min(cur_x + cur_w, px + pw) - max(cur_x, px))
+                min_w = min(cur_w, pw)
+                if overlap_x > min_w * 0.5:
+                    new_x = min(cur_x, px)
+                    new_y = min(cur_y, py)
+                    new_w = max(cur_x + cur_w, px + pw) - new_x
+                    new_h = max(cur_y + cur_h, py + ph) - new_y
+                    cur_x, cur_y, cur_w, cur_h = new_x, new_y, new_w, new_h
+                else:
+                    merged.append((cur_x, cur_y, cur_w, cur_h))
+                    cur_x, cur_y, cur_w, cur_h = px, py, pw, ph
+            merged.append((cur_x, cur_y, cur_w, cur_h))
+            plates = merged
+
+        # Snap plate top to image top to avoid cutting off tracks that
+        # extend all the way to the upper boundary.
+        plates = [
+            (x, 0, w, y + h) for (x, y, w, h) in plates
+        ]
+
         self.on_message(f"Stage 1: {len(plates)} plate(s) detected")
 
         # Stage 2: segment each plate
@@ -620,7 +959,7 @@ class TrackMask2Former(Model):
                 continue
 
             plate_area = ew * eh
-            plate_bbox = [px, py, pw, ph]
+            plate_bbox = [ex, ey, ew, eh]
             for inst in instances:
                 mask_area = inst["mask"].sum()
                 if mask_area > plate_area * 0.5:
@@ -676,39 +1015,64 @@ class TrackMask2Former(Model):
             shape.other_data["plate_id"] = inst["plate_id"]
             shape.other_data["plate_bbox"] = inst["plate_bbox"]
             source_shapes.append(shape)
-        # 按中心线最底部（y 最大）的 x 坐标从左往右排序后编号
+
         def _bottom_x(shape):
-            cl = shape.other_data.get("centerline") if shape.other_data else None
-            if cl:
-                bottom = max(cl, key=lambda p: p[1])  # (x, y)
-                return bottom[0]
             pts = shape.points
             if not pts:
                 return 0.0
             max_y = max(p.y() for p in pts)
             return min(p.x() for p in pts if p.y() == max_y)
+
         source_shapes.sort(key=_bottom_x)
         for s in source_shapes:
             source_id += 1
             s.label = f"source_{source_id}"
             shapes.append(s)
 
-        # Track shapes → linestrip with auto centerline + track_width
+        # Track shapes → linestrip with centerline + width (background drawn on demand)
         track_shapes = []
-        for inst in all_tracks:
-            centerline, half_width = mask_to_ribbon(inst["mask"], keypoint_interval=self._keypoint_interval)
+        for idx, inst in enumerate(all_tracks):
+            ribbon, centerline, hw, _bg_polygon, _bg_gap, _bg_side = mask_to_ribbon(
+                inst["mask"], keypoint_interval=self._keypoint_interval,
+                other_masks=None, force_bg_side=0.0)
+
+            if not ribbon or len(ribbon) < 3:
+                # Fallback: use mask contour
+                contours, _ = cv2.findContours(inst["mask"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    continue
+                cnt = max(contours, key=cv2.contourArea)
+                ribbon = [[float(p[0][0]), float(p[0][1])] for p in cnt]
+                if not centerline or len(centerline) < 2:
+                    # Extract centerline from mask skeleton
+                    try:
+                        from skimage.morphology import skeletonize
+                        from skimage.graph import route_through_array
+                        skel = skeletonize(inst["mask"].astype(bool))
+                        ys, xs = np.where(skel)
+                        if len(ys) >= 2:
+                            # Simple: top-to-bottom keypoint sampling
+                            ys_u = np.unique(ys)
+                            centerline = []
+                            for y in ys_u:
+                                x_vals = xs[ys == y]
+                                centerline.append([float(np.mean(x_vals)), float(y)])
+                    except Exception:
+                        centerline = []
+                hw = hw if hw else 5.0
+
             if not centerline or len(centerline) < 2:
                 continue
 
             track_len = 0.0
-            for i in range(1, len(centerline)):
+            for i in range(1, len(centerline) if centerline else 0):
                 dx = centerline[i][0] - centerline[i - 1][0]
                 dy = centerline[i][1] - centerline[i - 1][1]
                 track_len += (dx * dx + dy * dy) ** 0.5
-            if track_len < self._min_track_length:
+            if track_len < self._min_track_length and len(centerline) >= 2:
                 continue
 
-            track_width = int(round(half_width * 2))
+            track_width = int(round(hw * 2))
             shape = Shape(
                 label="track",
                 score=float(inst["confidence"]),
@@ -720,14 +1084,14 @@ class TrackMask2Former(Model):
             shape.other_data["plate_id"] = inst["plate_id"]
             shape.other_data["plate_bbox"] = inst["plate_bbox"]
             for pt in centerline:
-                shape.add_point(QtCore.QPointF(pt[0], pt[1]))
+                shape.add_point(QtCore.QPointF(float(pt[0]), float(pt[1])))
             track_shapes.append(shape)
-        # 按带状多边形最底部（y 最大）的 x 坐标从左往右排序后编号
-        track_shapes.sort(key=_bottom_x)
-        for s in track_shapes:
+
+        track_shapes.sort(key=lambda s: _bottom_x(s))
+        for shape in track_shapes:
             track_id += 1
-            s.label = f"track_{track_id}"
-            shapes.append(s)
+            shape.label = f"track_{track_id}"
+            shapes.append(shape)
 
         self.on_message(f"Done: {len(shapes)} shapes ({track_id} tracks, {source_id} sources)")
         return AutoLabelingResult(shapes, replace=self.replace)
@@ -742,3 +1106,231 @@ class TrackMask2Former(Model):
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+
+    def recompute_background_strips(self, shapes, H, W):
+        """Recompute background strips after user manually adds/edits track(s).
+
+        Called from label_widget when a new track polygon is drawn.
+        Groups tracks by plate, re-selects which track gets the bg strip,
+        and generates the background polygon directly from the track's own
+        centerline and track_width (no re-skeletonization).
+
+        Background centerline = track centerline offset by
+        (track_hw + bg_gap) along the normal direction.
+        Background width = track's own track_width (identical to the band
+        polygon drawn on canvas).
+
+        Args:
+            shapes: list of Shape objects from canvas (all shapes)
+            H, W: image height and width (pixels)
+
+        Returns:
+            (new_bg_shapes, old_bg_shapes): new background Shapes to add,
+            and existing background Shapes to remove.
+        """
+        import re
+
+        # Separate tracks, background shapes, and source shapes
+        tracks = []
+        bg_shapes_existing = []
+        for s in shapes:
+            if re.match(r"^track(_\d+)?$", s.label):
+                tracks.append(s)
+            elif s.other_data and s.other_data.get("_is_bg_strip"):
+                bg_shapes_existing.append(s)
+
+        if not tracks:
+            return [], bg_shapes_existing
+
+        # Collect existing plate_bboxes from tracks that have them
+        plate_bboxes = {}  # pid -> [x, y, w, h]
+        for t in tracks:
+            pid = t.other_data.get("plate_id") if t.other_data else None
+            if pid is not None:
+                pb = t.other_data.get("plate_bbox")
+                if pb is not None and pid not in plate_bboxes:
+                    plate_bboxes[pid] = pb
+
+        # Assign tracks without plate_id (manually drawn) to nearest plate
+        next_pid = max(plate_bboxes.keys(), default=-1) + 1
+        for t in tracks:
+            pid = t.other_data.get("plate_id") if t.other_data else None
+            if pid is not None:
+                continue
+            # Compute centroid
+            pts = t.points
+            if not pts:
+                continue
+            cx = sum(p.x() for p in pts) / len(pts)
+            cy = sum(p.y() for p in pts) / len(pts)
+
+            best_pid = None
+            best_dist = float("inf")
+            for pid_check, (px, py, pw, ph) in plate_bboxes.items():
+                pcx = px + pw / 2.0
+                pcy = py + ph / 2.0
+                dist = ((cx - pcx) ** 2 + (cy - pcy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pid = pid_check
+
+            if best_pid is not None and best_dist < max(W, H) * 0.3:
+                t.other_data["plate_id"] = best_pid
+            else:
+                # Assign to new virtual plate
+                t.other_data["plate_id"] = next_pid
+                xs = [p.x() for p in pts]
+                ys = [p.y() for p in pts]
+                plate_bboxes[next_pid] = [
+                    int(min(xs)), int(min(ys)),
+                    int(max(xs) - min(xs)), int(max(ys) - min(ys)),
+                ]
+                next_pid += 1
+
+        # Group tracks by plate_id
+        tracks_by_plate = {}  # pid -> [index in tracks list]
+        for i, t in enumerate(tracks):
+            pid = t.other_data.get("plate_id") if t.other_data else None
+            if pid is not None:
+                tracks_by_plate.setdefault(pid, []).append(i)
+
+        # Rasterize all track polygons to masks.
+        # For tracks with centerline data (AI-detected or manually drawn with
+        # computed ribbon), use fillPoly with the ribbon polygon for accuracy.
+        # Otherwise fall back to polylines (legacy / corrupt data).
+        track_masks = []
+        for t in tracks:
+            od = t.other_data if t.other_data else {}
+            centerline = od.get("centerline")
+            track_width = od.get("track_width", 14)
+
+            if centerline and len(centerline) >= 2:
+                mask = centerline_to_ribbon_mask(centerline, track_width, H, W)
+            else:
+                mask = np.zeros((H, W), dtype=np.uint8)
+                pts_arr = np.array([[int(p.x()), int(p.y())] for p in t.points], dtype=np.int32)
+                if len(pts_arr) >= 2:
+                    hw_r = track_width // 2
+                    cv2.polylines(mask, [pts_arr], isClosed=False, color=1,
+                                  thickness=max(1, hw_r * 2))
+            track_masks.append(mask)
+
+        # For each plate, determine which track gets the bg strip and generate it
+        new_bg_shapes = []
+        for pid, idxs in tracks_by_plate.items():
+            if len(idxs) == 1:
+                bg_track_idx = idxs[0]
+                forced_side = 0.0
+                other = None
+            else:
+                # Top → 判断整体偏左偏右; Bottom → 选为哪个轨迹画背景
+                top_xs = []
+                bottom_xs = []
+                for i in idxs:
+                    mask = track_masks[i]
+                    ys, xp = np.where(mask > 0)
+                    if len(ys) == 0:
+                        top_xs.append(float("nan"))
+                        bottom_xs.append(float("nan"))
+                    else:
+                        top_y = ys.min()
+                        top_xs.append(float(xp[ys == top_y].mean()))
+                        bottom_y = ys.max()
+                        bottom_xs.append(float(xp[ys == bottom_y].mean()))
+
+                pid_bbox = plate_bboxes.get(pid)
+                if pid_bbox is None:
+                    combined = np.zeros((H, W), dtype=np.uint8)
+                    for i in idxs:
+                        combined[track_masks[i] > 0] = 1
+                    ys_all, xs_all = np.where(combined > 0)
+                    if len(ys_all) == 0:
+                        plate_cx = W / 2.0
+                    else:
+                        plate_cx = (xs_all.min() + xs_all.max()) / 2.0
+                else:
+                    plate_cx = pid_bbox[0] + pid_bbox[2] / 2.0
+
+                avg_top_x = np.nanmean(top_xs)
+
+                if avg_top_x < plate_cx:
+                    # 整体偏左 → 选底部最靠右的轨迹（最靠近中心）→ bg 在右侧 (-1)
+                    middle_i = idxs[int(np.nanargmax(bottom_xs))]
+                    forced_side = -1.0
+                else:
+                    # 整体偏右 → 选底部最靠左的轨迹（最靠近中心）→ bg 在左侧 (+1)
+                    middle_i = idxs[int(np.nanargmin(bottom_xs))]
+                    forced_side = +1.0
+
+                bg_track_idx = middle_i
+                # Build other_masks for non-selected tracks in this plate
+                other = np.zeros((H, W), dtype=np.uint8)
+                for j in idxs:
+                    if j != middle_i:
+                        other[track_masks[j] > 0] = 1
+
+            # ── Build background directly from track's own data ──
+            track = tracks[bg_track_idx]
+            track_cl = track.other_data.get("centerline")
+            track_width = track.other_data.get("track_width", 14)
+            if not track_cl or len(track_cl) < 2:
+                continue
+            track_hw = track_width / 2.0
+            bg_gap = max(30.0, track_hw)
+            bg_offset = bg_gap + track_width  # = track_hw + bg_gap + track_hw  → 轨道边→背景边 = bg_gap
+
+            # Track mask Y range for endpoint extension
+            track_mask = track_masks[bg_track_idx]
+            track_ys = np.where(track_mask > 0)[0]
+            if len(track_ys) == 0:
+                continue
+            track_y_min = float(track_ys.min())
+            track_y_max = float(track_ys.max())
+
+            # Determine bg_side
+            if abs(forced_side) > 0.001:
+                bg_side = forced_side
+            else:
+                # Single track: try both sides, pick the one with less
+                # overlap against other masks in the same plate
+                best_side_val = +1.0
+                best_overlap = float("inf")
+                for sign in [+1.0, -1.0]:
+                    test_cl = _offset_centerline(track_cl, sign * bg_offset)
+                    test_cl = _extend_centerline_y(test_cl, track_y_min, track_y_max)
+                    test_band = centerline_to_ribbon(test_cl, track_width)
+                    if not test_band or len(test_band) < 6:
+                        continue
+                    test_mask = np.zeros((H, W), dtype=np.uint8)
+                    cv2.fillPoly(test_mask, [np.array(test_band, dtype=np.int32)], 1)
+                    overlap = int(np.sum(test_mask & (other > 0))) if other is not None else 0
+                    if overlap < best_overlap:
+                        best_overlap = overlap
+                        best_side_val = sign
+                bg_side = best_side_val
+
+            # Background centerline = track centerline offset along normal
+            bg_centerline = _offset_centerline(track_cl, bg_side * bg_offset)
+
+            # Extend centerline endpoints so Y range covers the track's full
+            # Y span (track_y_min … track_y_max)
+            bg_centerline = _extend_centerline_y(bg_centerline, track_y_min, track_y_max)
+
+            bg_shape = Shape(
+                label="background",
+                score=0.0,
+                shape_type="linestrip",
+                flags={},
+            )
+            bg_shape.other_data["_is_bg_strip"] = True
+            bg_shape.other_data["bg_gap"] = bg_gap
+            bg_shape.other_data["bg_side"] = bg_side
+            bg_shape.other_data["plate_id"] = pid
+            bg_shape.other_data["track_width"] = track_width
+            bg_shape.other_data["centerline"] = bg_centerline
+            bg_shape.other_data["ref_centerline"] = track_cl  # 原始参考轨迹中心线
+            for x, y in bg_centerline:
+                bg_shape.add_point(QtCore.QPointF(float(x), float(y)))
+            new_bg_shapes.append(bg_shape)
+
+        return new_bg_shapes, bg_shapes_existing

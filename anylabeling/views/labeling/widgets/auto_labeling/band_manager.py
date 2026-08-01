@@ -24,6 +24,9 @@ class BandManager:
                     self._centerline_shapes.append(s)
                     if len(s.points) >= 2:
                         cl = [(p.x(), p.y()) for p in s.points]
+                        # 确保 centerline 从上到下 (Y 递增)
+                        if cl[0][1] > cl[-1][1]:
+                            cl = list(reversed(cl))
                         s.other_data["centerline"] = cl
                         w = s.other_data.get("track_width", width)
                         bs = self._make_band(cl, w, s.label, s.line_color, s.fill_color)

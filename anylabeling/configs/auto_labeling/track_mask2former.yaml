@@ -1,9 +1,18 @@
-type: track_mask2former
-name: track_mask2former
-provider: Local
-display_name: Track Mask2Former (Auto Width)
-model_path: D:/desk/data/log/project/mask2former_plus/checkpoints/last_model
-plate_model_path: D:/desk/X-AnyLabeling/anylabeling/services/auto_labeling/models/plate_yolo/best.pt
+E_bin_max: 60.0
+E_bin_min: 1.0
+al_density_g_cm3: 2.7
+al_range_energy_path: C:/Users/Lenovo/Desktop/质子穿透.xlsx
+al_range_energy_sheet: Al
+al_thickness_cm: 0.0015
 conf_threshold: 0.3
-min_track_length: 30
-keypoint_interval: 30
+dE_MeV: -0.2
+display_name: Track Mask2Former (Auto Width)
+ip_fading_exponent: -0.161
+ip_fading_ref_min: 30.0
+model_path: C:/Users/Lenovo/Desktop/project/mask2former_plus/checkpoints/best_model
+name: track_mask2former
+plate_model_path: anylabeling/services/auto_labeling/models/plate_yolo/best.pt
+provider: Local
+r_to_e_path: C:/Users/Lenovo/Desktop/r_E_proton_TP3_0822.txt
+r_tp_cm: 90.0
+type: track_mask2former

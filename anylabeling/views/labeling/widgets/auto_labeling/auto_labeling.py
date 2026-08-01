@@ -26,7 +26,6 @@ from anylabeling.services.auto_labeling import (
     _SKIP_DET_MODELS,
     _SKIP_PREDICTION_ON_NEW_MARKS_MODELS,
 )
-from anylabeling.services.auto_labeling.energy_spectrum import compute_spectra
 from anylabeling.views.labeling.chatbot.style import ChatbotDialogStyle
 from anylabeling.views.labeling.logger import logger
 from anylabeling.views.labeling.utils.theme import get_theme
@@ -129,7 +128,7 @@ class AutoLabelingWidget(QWidget):
         self._update_model_selection_scroll_area_height()
 
         self.skip_auto_prediction = False
-        self._default_track_width = 15
+        self._default_track_width = 10
         self._band_mode = False
         self._band_shapes = []
         self._centerline_shapes = []
@@ -440,63 +439,25 @@ class AutoLabelingWidget(QWidget):
             self._on_shape_selected
         )
 
-        # ---- Arc-residual controls (created programmatically) ----
-        self.toggle_arc_residual = QPushButton(self.tr("Arc Refine (Off)"))
-        self.toggle_arc_residual.setCheckable(True)
-        self.toggle_arc_residual.setChecked(False)
-        self.toggle_arc_residual.setToolTip(
-            self.tr("Enable arc-residual split/merge refinement")
+        # ---- Detect Plates button (for track_mask2former) ----
+        self.button_detect_plates = QPushButton(self.tr("检测Plate"))
+        self.button_detect_plates.setToolTip(
+            self.tr("对当前图片检测Plate区域并显示各Plate子图")
         )
-        self.toggle_arc_residual.clicked.connect(
-            self._on_toggle_arc_residual
+        self.button_detect_plates.clicked.connect(
+            self._on_detect_plates
         )
-        self.verticalLayout.addWidget(self.toggle_arc_residual)
+        self.verticalLayout.addWidget(self.button_detect_plates)
 
-        self.arc_split_nrmse_widget = QWidget()
-        split_layout = QHBoxLayout(self.arc_split_nrmse_widget)
-        split_layout.setSpacing(8)
-        split_label = QLabel(self.tr("Split NRMSE"))
-        split_label.setMinimumSize(0, 16)
-        self.edit_arc_split_nrmse = QDoubleSpinBox()
-        self.edit_arc_split_nrmse.setMinimumSize(80, 0)
-        self.edit_arc_split_nrmse.setDecimals(4)
-        self.edit_arc_split_nrmse.setRange(0.001, 1.0)
-        self.edit_arc_split_nrmse.setSingleStep(0.01)
-        self.edit_arc_split_nrmse.setValue(0.05)
-        self.edit_arc_split_nrmse.valueChanged.connect(
-            self._on_arc_split_nrmse_changed
+        # ---- Draw Background button (for track_mask2former) ----
+        self.button_draw_background = QPushButton(self.tr("绘制背景"))
+        self.button_draw_background.setToolTip(
+            self.tr("根据当前plate标注情况，为每条plate绘制背景条带")
         )
-        split_layout.addWidget(split_label)
-        split_layout.addWidget(self.edit_arc_split_nrmse)
-        self.verticalLayout.addWidget(self.arc_split_nrmse_widget)
-
-        self.arc_merge_nrmse_widget = QWidget()
-        merge_layout = QHBoxLayout(self.arc_merge_nrmse_widget)
-        merge_layout.setSpacing(8)
-        merge_label = QLabel(self.tr("Merge NRMSE"))
-        merge_label.setMinimumSize(0, 16)
-        self.edit_arc_merge_nrmse = QDoubleSpinBox()
-        self.edit_arc_merge_nrmse.setMinimumSize(80, 0)
-        self.edit_arc_merge_nrmse.setDecimals(4)
-        self.edit_arc_merge_nrmse.setRange(0.001, 1.0)
-        self.edit_arc_merge_nrmse.setSingleStep(0.01)
-        self.edit_arc_merge_nrmse.setValue(0.03)
-        self.edit_arc_merge_nrmse.valueChanged.connect(
-            self._on_arc_merge_nrmse_changed
+        self.button_draw_background.clicked.connect(
+            self._on_draw_background
         )
-        merge_layout.addWidget(merge_label)
-        merge_layout.addWidget(self.edit_arc_merge_nrmse)
-        self.verticalLayout.addWidget(self.arc_merge_nrmse_widget)
-
-        # ---- Energy spectrum button (for track_mask2former) ----
-        self.button_energy_spectrum = QPushButton(self.tr("计算能谱图"))
-        self.button_energy_spectrum.setToolTip(
-            self.tr("对当前图片中的所有轨迹计算能谱图")
-        )
-        self.button_energy_spectrum.clicked.connect(
-            self._on_energy_spectrum
-        )
-        self.verticalLayout.addWidget(self.button_energy_spectrum)
+        self.verticalLayout.addWidget(self.button_draw_background)
 
         # ===================================
         #  End of Auto labeling buttons
@@ -1146,8 +1107,8 @@ class AutoLabelingWidget(QWidget):
         elif model_config.get("type") == "remote_server":
             self.update_remote_server_mode_ui()
 
-        # Initialize track centerline sliders to model
-        if model_config.get("type") in ("track_centerline", "track_centerline_light", "track_mask2former"):
+        # Initialize track sliders for track_mask2former
+        if model_config.get("type") == "track_mask2former":
             self.model_manager.set_auto_labeling_min_track_length(
                 self.edit_min_track_length.value()
             )
@@ -1158,46 +1119,15 @@ class AutoLabelingWidget(QWidget):
                 self.edit_track_width.value()
             )
 
-        # Initialize arc-residual controls for track_instance_seg
-        if model_config.get("type") == "track_instance_seg":
-            self.toggle_arc_residual.setChecked(False)
-            self._on_toggle_arc_residual(False)
-            self.model_manager.set_auto_labeling_arc_residual(
-                self.toggle_arc_residual.isChecked()
-            )
-            self.model_manager.set_auto_labeling_arc_split_nrmse(
-                self.edit_arc_split_nrmse.value()
-            )
-            self.model_manager.set_auto_labeling_arc_merge_nrmse(
-                self.edit_arc_merge_nrmse.value()
-            )
-
-        if model_config.get("type") not in ("track_centerline", "track_mask2former"):
+        if model_config.get("type") != "track_mask2former":
             self._editing_track_shape = None
             self.input_track_width.hide()
             self.edit_track_width.hide()
             self.input_per_track_width.hide()
             self.edit_per_track_width.hide()
             self.button_toggle_band.hide()
-
-    def _on_toggle_arc_residual(self, checked):
-        """Handle arc-residual toggle."""
-        if checked:
-            self.toggle_arc_residual.setText(self.tr("Arc Refine (On)"))
-        else:
-            self.toggle_arc_residual.setText(self.tr("Arc Refine (Off)"))
-        self.arc_split_nrmse_widget.setVisible(checked)
-        self.arc_merge_nrmse_widget.setVisible(checked)
-        self._update_model_selection_scroll_area_height()
-        self.model_manager.set_auto_labeling_arc_residual(checked)
-
-    def _on_arc_split_nrmse_changed(self, value):
-        """Handle arc split NRMSE threshold change."""
-        self.model_manager.set_auto_labeling_arc_split_nrmse(value)
-
-    def _on_arc_merge_nrmse_changed(self, value):
-        """Handle arc merge NRMSE threshold change."""
-        self.model_manager.set_auto_labeling_arc_merge_nrmse(value)
+            self.button_detect_plates.hide()
+            self.button_draw_background.hide()
 
     def update_upn_mode_ui(self):
         """Update UPN mode combobox to reflect current backend state"""
@@ -1308,10 +1238,8 @@ class AutoLabelingWidget(QWidget):
             "edit_per_track_width",
             "input_per_track_width",
             "button_toggle_band",
-            "button_energy_spectrum",
-            "toggle_arc_residual",
-            "arc_split_nrmse_widget",
-            "arc_merge_nrmse_widget",
+            "button_detect_plates",
+            "button_draw_background",
         ]
         for widget in widgets:
             getattr(self, widget).hide()
@@ -1958,6 +1886,9 @@ class AutoLabelingWidget(QWidget):
             new_pts = self._regenerate_band_polygon(cl, value / 2.0)
             self._editing_track_shape.points = [QPointF(x, y) for x, y in new_pts]
             self._editing_track_shape.other_data["track_width"] = value
+            cl_ref = self._editing_track_shape.other_data.get("_cl_ref")
+            if cl_ref is not None:
+                cl_ref.other_data["track_width"] = value
             # Sync to centerline
             label = self._editing_track_shape.label
             for cl_s in self._centerline_shapes:
@@ -1982,6 +1913,9 @@ class AutoLabelingWidget(QWidget):
             new_pts = self._regenerate_band_polygon(cl, value / 2.0)
             self._editing_track_shape.points = [QPointF(x, y) for x, y in new_pts]
             self._editing_track_shape.other_data["track_width"] = value
+            cl_ref = self._editing_track_shape.other_data.get("_cl_ref")
+            if cl_ref is not None:
+                cl_ref.other_data["track_width"] = value
             label = self._editing_track_shape.label
             for cl_s in self._centerline_shapes:
                 if cl_s.label == label:
@@ -2011,6 +1945,10 @@ class AutoLabelingWidget(QWidget):
             if length < 1e-6:
                 continue
             nx, ny = -dy / length, dx / length
+            # Force horizontal at endpoints
+            if i == 0 or i == n - 1:
+                ny = 0.0
+                nx = 1.0 if nx > 0 else -1.0
             left_pts.append((points[i][0] + nx * half_width, points[i][1] + ny * half_width))
             right_pts.append((points[i][0] - nx * half_width, points[i][1] - ny * half_width))
         if len(left_pts) < 2:
@@ -2033,12 +1971,16 @@ class AutoLabelingWidget(QWidget):
                     self._centerline_shapes.append(s)
                     if len(s.points) >= 2:
                         cl = [(p.x(), p.y()) for p in s.points]
+                        # 确保 centerline 从上到下 (Y 递增)
+                        if cl[0][1] > cl[-1][1]:
+                            cl = list(reversed(cl))
                         s.other_data["centerline"] = cl
                         w = s.other_data.get("track_width", self._default_track_width)
                         s.other_data["track_width"] = w
                         band_pts = self._regenerate_band_polygon(cl, w / 2.0)
                         bs = type(s)(label=s.label, shape_type="polygon", flags={})
                         bs.other_data["_is_band"] = True
+                        bs.other_data["_cl_ref"] = s          # back-ref to centerline
                         bs.other_data["centerline"] = cl
                         bs.other_data["track_width"] = w
                         bs.line_color = s.line_color
@@ -2047,14 +1989,79 @@ class AutoLabelingWidget(QWidget):
                         for x, y in band_pts:
                             bs.add_point(QPointF(x, y))
                         self._band_shapes.append(bs)
+                elif (s.other_data.get("_is_bg_strip")
+                      and s.shape_type in ("linestrip", "line")
+                      and len(s.points) >= 2):
+                    # Background: sync centerline from current points (user may
+                    # have edited them), then regenerate band polygon
+                    cl = [(p.x(), p.y()) for p in s.points]
+                    s.other_data["centerline"] = cl
+                    w = s.other_data.get("track_width", self._default_track_width)
+                    band_pts = self._regenerate_band_polygon(cl, w / 2.0)
+                    bs = type(s)(label=s.label, shape_type="polygon", flags={})
+                    bs.other_data["_is_band"] = True
+                    bs.other_data["_is_bg_strip"] = True
+                    bs.other_data["_cl_ref"] = s          # back-ref to centerline
+                    bs.other_data["centerline"] = cl
+                    bs.other_data["track_width"] = w
+                    bs.other_data["bg_gap"] = s.other_data.get("bg_gap")
+                    bs.other_data["bg_side"] = s.other_data.get("bg_side")
+                    bs.other_data["plate_id"] = s.other_data.get("plate_id")
+                    bs.line_color = s.line_color
+                    bs.fill_color = s.fill_color
+                    bs.fill = True
+                    for x, y in band_pts:
+                        bs.add_point(QPointF(x, y))
+                    self._band_shapes.append(bs)
                 else:
                     kept.append(s)
             self.parent.canvas.shapes = kept + self._band_shapes
+            # Update label-list: point items to band polygons so
+            # visibility toggles affect the shapes actually on canvas
+            for bs in self._band_shapes:
+                cl_ref = bs.other_data.get("_cl_ref")
+                if cl_ref is not None:
+                    item = self.parent.label_list.find_item_by_shape(cl_ref)
+                    if item is not None:
+                        item.set_shape(bs)
         else:
             existing = {id(s): s for s in self.parent.canvas.shapes}
             for cl_s in self._centerline_shapes:
                 if id(cl_s) not in existing:
                     self.parent.canvas.shapes.append(cl_s)
+            # Create background centerline linestrips from band shapes
+            for bs in self._band_shapes:
+                if (bs.other_data.get("_is_bg_strip")
+                        and bs.other_data.get("centerline")):
+                    cl = bs.other_data["centerline"]
+                    bg_cl = type(bs)(
+                        label=bs.label, shape_type="linestrip", flags={},
+                    )
+                    bg_cl.other_data["_is_bg_strip"] = True
+                    bg_cl.other_data["centerline"] = cl
+                    bg_cl.other_data["track_width"] = bs.other_data.get(
+                        "track_width")
+                    bg_cl.other_data["bg_gap"] = bs.other_data.get("bg_gap")
+                    bg_cl.other_data["bg_side"] = bs.other_data.get("bg_side")
+                    bg_cl.other_data["plate_id"] = bs.other_data.get("plate_id")
+                    bg_cl.other_data["ref_centerline"] = bs.other_data.get(
+                        "ref_centerline")
+                    bg_cl.line_color = bs.line_color
+                    for x, y in cl:
+                        bg_cl.add_point(QPointF(x, y))
+                    self.parent.canvas.shapes.append(bg_cl)
+                    # Update label-list reference so visibility toggle works
+                    old_item = self.parent.label_list.find_item_by_shape(bs)
+                    if old_item is not None:
+                        old_item.set_shape(bg_cl)
+            # Restore label-list for track band polygons → centerlines
+            for bs in self._band_shapes:
+                cl_ref = bs.other_data.get("_cl_ref")
+                if cl_ref is None or bs.other_data.get("_is_bg_strip"):
+                    continue
+                item = self.parent.label_list.find_item_by_shape(bs)
+                if item is not None:
+                    item.set_shape(cl_ref)
             self._editing_track_shape = None
             self.input_track_width.show()
             self.edit_track_width.show()
@@ -2069,7 +2076,7 @@ class AutoLabelingWidget(QWidget):
         """Handle shape selection: if band polygon clicked, show per-track width slider."""
         self._editing_track_shape = None
         loaded_config = self.model_manager.loaded_model_config or {}
-        if loaded_config.get("type") not in ("track_centerline", "track_mask2former"):
+        if loaded_config.get("type") != "track_mask2former":
             self.input_per_track_width.hide()
             self.edit_per_track_width.hide()
             return
@@ -2096,6 +2103,39 @@ class AutoLabelingWidget(QWidget):
             for cl_s in self._centerline_shapes:
                 if id(cl_s) not in existing:
                     self.parent.canvas.shapes.append(cl_s)
+            # Restore background centerlines
+            for bs in self._band_shapes:
+                if (bs.other_data.get("_is_bg_strip")
+                        and bs.other_data.get("centerline")):
+                    cl = bs.other_data["centerline"]
+                    bg_cl = type(bs)(
+                        label=bs.label, shape_type="linestrip", flags={},
+                    )
+                    bg_cl.other_data["_is_bg_strip"] = True
+                    bg_cl.other_data["centerline"] = cl
+                    bg_cl.other_data["track_width"] = bs.other_data.get(
+                        "track_width")
+                    bg_cl.other_data["bg_gap"] = bs.other_data.get("bg_gap")
+                    bg_cl.other_data["bg_side"] = bs.other_data.get("bg_side")
+                    bg_cl.other_data["plate_id"] = bs.other_data.get("plate_id")
+                    bg_cl.other_data["ref_centerline"] = bs.other_data.get(
+                        "ref_centerline")
+                    bg_cl.line_color = bs.line_color
+                    for x, y in cl:
+                        bg_cl.add_point(QPointF(x, y))
+                    self.parent.canvas.shapes.append(bg_cl)
+                    # Update label-list reference so visibility toggle works
+                    old_item = self.parent.label_list.find_item_by_shape(bs)
+                    if old_item is not None:
+                        old_item.set_shape(bg_cl)
+            # Restore label-list for track band polygons → centerlines
+            for bs in self._band_shapes:
+                cl_ref = bs.other_data.get("_cl_ref")
+                if cl_ref is None or bs.other_data.get("_is_bg_strip"):
+                    continue
+                item = self.parent.label_list.find_item_by_shape(bs)
+                if item is not None:
+                    item.set_shape(cl_ref)
             if hasattr(self.parent, "set_dirty") and self.parent.filename:
                 try:
                     self.parent.set_dirty()
@@ -2122,58 +2162,10 @@ class AutoLabelingWidget(QWidget):
         self.model_manager.set_mask_fineness(epsilon)
         self.mask_fineness_changed.emit(epsilon)
 
-    def _on_energy_spectrum(self):
-        """计算当前图片所有轨迹的能谱图"""
-        image_path = getattr(self.parent, "image_path", None)
-        if not image_path or not os.path.isfile(image_path):
-            self.model_manager.new_model_status.emit(
-                self.tr("无法获取当前图片路径")
-            )
-            return
+    def _on_detect_plates(self):
+        """检测Plate区域并显示子图面板"""
+        self.parent._detect_plates_and_show_panel()
 
-        # 收集 canvas 上的所有 shape
-        canvas = self.parent.canvas
-        exclude_labels = {AutoLabelingMode.OBJECT, AutoLabelingMode.ADD, AutoLabelingMode.REMOVE}
-        shapes = []
-        for s in canvas.shapes:
-            if s.label in exclude_labels:
-                continue
-            d = {
-                "label": s.label,
-                "points": [[p.x(), p.y()] for p in s.points],
-                "shape_type": s.shape_type,
-                "other_data": dict(s.other_data) if s.other_data else {},
-            }
-            shapes.append(d)
-
-        track_count = sum(1 for s in shapes if s["label"].startswith("track"))
-        source_count = sum(1 for s in shapes if s["label"].startswith("source"))
-        if track_count == 0:
-            self.model_manager.new_model_status.emit(
-                self.tr("当前图片没有轨迹，请先运行推理")
-            )
-            return
-
-        output_dir = Path(image_path).parent / Path(image_path).stem
-        self.model_manager.new_model_status.emit(
-            f"正在计算能谱图... {track_count} 条轨迹, {source_count} 个 source → {output_dir}"
-        )
-
-        try:
-            result = compute_spectra(
-                image_path=image_path,
-                shapes=shapes,
-                output_dir=str(output_dir),
-                progress_callback=self.model_manager.new_model_status.emit,
-            )
-        except Exception as e:
-            self.model_manager.new_model_status.emit(
-                self.tr("能谱计算失败: {err}").format(err=str(e))
-            )
-            logger.error(f"Energy spectrum error: {e}", exc_info=True)
-            return
-
-        if result:
-            self.model_manager.new_model_status.emit(
-                f"✓ 能谱计算完成: {result['plates']} 个 plate, {result['tracks']} 条轨迹 → {output_dir}"
-            )
+    def _on_draw_background(self):
+        """根据当前标注为每条plate绘制背景条带"""
+        self.parent._recompute_background_strips()

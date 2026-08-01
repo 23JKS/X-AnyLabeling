@@ -2264,7 +2264,7 @@ class LabelingWidget(LabelDialog):
         central_layout.addWidget(self.label_instruction)
         central_layout.addSpacing(5)
         central_layout.addWidget(self.auto_labeling_widget)
-        central_layout.addWidget(scroll_area)
+        central_layout.addWidget(scroll_area, stretch=10)
         central_layout.addWidget(self.compare_view_slider)
         layout.addLayout(central_layout)
 
@@ -5000,6 +5000,14 @@ class LabelingWidget(LabelDialog):
                     if canvas_shape is shape:
                         self.update_attributes(i)
                         break
+
+            # Re-number bare track labels so recompute can find them
+            if text in ("track", "source") or text.startswith("track_") or text.startswith("source_"):
+                self._renumber_tracks_and_sources()
+
+            # Recompute background strips if user added a track polygon
+            if shape.label.startswith("track_"):
+                self._recompute_background_strips()
         else:
             self.canvas.undo_last_line()
             self.canvas.shapes_backups.pop()
@@ -6264,23 +6272,18 @@ class LabelingWidget(LabelDialog):
         """删除 shape 后重新编号 track_N 和 source_N，按 x 坐标从左往右."""
         import re
 
-        # 收集 track 和 source
+        # 收集 track 和 source（含未编号的裸标签）
         tracks = []
         sources = []
         for s in self.canvas.shapes:
-            if re.match(r"^track_\d+$", s.label):
+            if re.match(r"^track(_\d+)?$", s.label):
                 tracks.append(s)
-            elif re.match(r"^source_\d+$", s.label):
+            elif re.match(r"^source(_\d+)?$", s.label):
                 sources.append(s)
 
-        # 按中心线最底部（y 最大）的 x 坐标从左往右排序
+        # 按多边形底部（y 最大）的 x 坐标从左往右排序
+        # 有多个底部点时取 x 最小的
         def _bottom_x(shape):
-            cl = shape.other_data.get("centerline") if shape.other_data else None
-            if cl:
-                # track: 用 centerline 底部点
-                bottom = max(cl, key=lambda p: p[1])  # (x, y), 取 y 最大
-                return bottom[0]
-            # source / 无 centerline: 用多边形底部点
             pts = shape.points
             if not pts:
                 return 0.0
@@ -6299,9 +6302,269 @@ class LabelingWidget(LabelDialog):
             if s.label != new_label:
                 s.label = new_label
 
+        # 为手动绘制（无 centerline 数据）的 track 补齐 other_data
+        for s in tracks:
+            if not s.other_data.get("centerline"):
+                s.other_data["centerline"] = [(p.x(), p.y()) for p in s.points]
+            if not s.other_data.get("track_width"):
+                s.other_data["track_width"] = 14  # 默认宽度
+
         # 刷新 UI
         self.canvas.update()
         self.label_list.update()
+
+    def _recompute_background_strips(self):
+        """Recompute background strip polygons after manual track addition/editing.
+
+        Called when user draws a new track polygon. Groups tracks by plate,
+        re-selects which track gets the background strip, and replaces old
+        background shapes with newly generated ones.
+        """
+        import re
+        if not self.image:
+            return
+        try:
+            H = self.image.height()
+            W = self.image.width()
+        except Exception:
+            return
+
+        new_bg, old_bg = self.auto_labeling_widget.model_manager.recompute_background_strips(
+            self.canvas.shapes, H, W
+        )
+        if not new_bg and not old_bg:
+            return
+
+        # Remove old background shapes from canvas and label list
+        for bg_s in old_bg:
+            try:
+                if bg_s in self.canvas.shapes:
+                    self.canvas.shapes.remove(bg_s)
+                item = self.label_list.find_item_by_shape(bg_s)
+                if item:
+                    self.label_list.remove_item(item)
+            except (ValueError, AttributeError):
+                pass
+
+        # Add new background shapes (respect band mode)
+        aw = self.auto_labeling_widget
+        band_mode = aw._band_mode
+        for bg_s in new_bg:
+            cl = bg_s.other_data.get("centerline")
+            if cl and len(cl) >= 2:
+                if band_mode:
+                    # Show as band polygon
+                    w = bg_s.other_data.get(
+                        "track_width", aw._default_track_width,
+                    )
+                    band_pts = aw._regenerate_band_polygon(cl, w / 2.0)
+                    bg_s.points = [QtCore.QPointF(x, y) for x, y in band_pts]
+                    bg_s.shape_type = "polygon"
+                    bg_s.other_data["_is_band"] = True
+                    aw._band_shapes.append(bg_s)
+                else:
+                    # Show as centerline linestrip
+                    bg_s.points = [QtCore.QPointF(x, y) for x, y in cl]
+                    bg_s.shape_type = "linestrip"
+            self.canvas.shapes.append(bg_s)
+
+        # Re-number tracks and sources (new track may change order)
+        self._renumber_tracks_and_sources()
+
+        # Sync label list surgically (avoid clear+rebuild which triggers
+        # itemDropped→label_order_changed→canvas.load_shapes signal cascade)
+        # 1) Add new bg items
+        for bg_s in new_bg:
+            self.add_label(bg_s, update_last_label=False,
+                           refresh_filters=False)
+        # 2) Update track label text if renumbered
+        for s in self.canvas.shapes:
+            if re.match(r"^(track|source)(_\d+)?$", s.label):
+                item = self.label_list.find_item_by_shape(s)
+                if item is not None and item.text() != s.label:
+                    item.setText(s.label)
+        self._refresh_shape_filters()
+
+        self.canvas.update()
+        self.set_dirty()
+
+    def _detect_plates_and_show_panel(self):
+        """Run YOLO plate detection, assign shapes to plates, and show a popup dialog."""
+        import yaml
+        import importlib.resources as pkg_resources
+        import anylabeling.configs.auto_labeling as auto_labeling_configs
+
+        if not self.image or not self.image_path:
+            return
+
+        # Load plate YOLO model path from track_mask2former config
+        try:
+            config_path = pkg_resources.files(auto_labeling_configs) / "track_mask2former.yaml"
+            with open(config_path, "r", encoding="utf-8") as f:
+                model_config = yaml.safe_load(f)
+            plate_model_path = model_config.get("plate_model_path", "")
+        except Exception:
+            plate_model_path = ""
+
+        # Resolve relative path (original behavior depended on CWD = project root)
+        if plate_model_path:
+            plate_model_path = os.path.abspath(plate_model_path)
+
+        if not plate_model_path or not os.path.isfile(plate_model_path):
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.tr("Plate Detection"),
+                self.tr("YOLO plate model not found:\n{path}").format(path=plate_model_path),
+            )
+            return
+
+        # Read current image
+        try:
+            data = np.fromfile(self.image_path, dtype=np.uint8)
+            img_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                return
+            H, W = img_bgr.shape[:2]
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        except Exception:
+            return
+
+        # Run YOLO plate detection
+        from anylabeling.services.auto_labeling.track_mask2former import find_plates_yolo
+        plates = find_plates_yolo(img_rgb, plate_model_path)
+
+        # Force each bbox top to image top so tracks are never cut off
+        plates = [(x, 0, w, h + y) for (x, y, w, h) in plates]
+
+        if not plates:
+            QtWidgets.QMessageBox.information(
+                self,
+                self.tr("Plate Detection"),
+                self.tr("No plate regions detected in this image."),
+            )
+            return
+
+        # Assign existing shapes to plates (if any)
+        assigned = 0
+        for shape in self.canvas.shapes:
+            pts = shape.points
+            if not pts:
+                continue
+            cx = sum(p.x() for p in pts) / len(pts)
+            cy = sum(p.y() for p in pts) / len(pts)
+            for pid, (x, y, w, h) in enumerate(plates, 1):
+                if x <= cx <= x + w and y <= cy <= y + h:
+                    shape.other_data["plate_id"] = pid
+                    shape.other_data["plate_bbox"] = [x, y, w, h]
+                    assigned += 1
+                    break
+
+        logger.info(
+            f"Plate detection: {len(plates)} plates, {assigned} shapes assigned"
+        )
+
+        # Build plates_data directly from YOLO bboxes + assign shapes from canvas
+        import re
+        from anylabeling.services.auto_labeling.track_mask2former import centerline_to_ribbon
+
+        plates_data = []
+        for pid, (x, y, w, h) in enumerate(plates, 1):
+            pad = int(min(w, h) * 0.05)
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(W, x + w + pad)
+            y2 = min(H, y + h + pad)
+
+            crop = img_bgr[y1:y2, x1:x2]
+            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+
+            # Gather shapes that belong to this plate
+            shapes = []
+            bg_strips = []
+            for s in self.canvas.shapes:
+                od = s.other_data or {}
+                if od.get("plate_id") == pid:
+                    label = s.label
+                    if od.get("_is_bg_strip"):
+                        # Regenerate ribbon polygon from centerline.
+                        # (Raw s.points may be a linestrip when band_mode
+                        # is off, so we must reconstruct.)
+                        cl = od.get("centerline") or [(p.x(), p.y()) for p in s.points]
+                        tw = od.get("track_width", 14)
+                        ribbon = centerline_to_ribbon(cl, tw)
+                        if ribbon:
+                            global_pts = [[float(rx), float(ry)] for rx, ry in ribbon]
+                            pts = [[rx - x1, ry - y1] for rx, ry in ribbon]
+                        else:
+                            global_pts = [[float(p.x()), float(p.y())] for p in s.points]
+                            pts = [[p.x() - x1, p.y() - y1] for p in s.points]
+                        bg_strips.append({"label": "background", "display_label": "bg", "points": pts,
+                                           "global_points": global_pts,
+                                           "other_data": dict(od), "plate_bbox": [x, y, w, h]})
+                    elif re.match(r"^track_\d+$", label):
+                        # Compute ribbon polygon from centerline + width
+                        cl = od.get("centerline") or [(p.x(), p.y()) for p in s.points]
+                        tw = od.get("track_width", 14)
+                        ribbon = centerline_to_ribbon(cl, tw)
+                        if ribbon:
+                            global_pts = [[float(rx), float(ry)] for rx, ry in ribbon]
+                            pts = [[rx - x1, ry - y1] for rx, ry in ribbon]
+                        else:
+                            global_pts = [[float(p.x()), float(p.y())] for p in s.points]
+                            pts = [[p.x() - x1, p.y() - y1] for p in s.points]
+                        shapes.append({"label": label, "display_label": f"t{len(shapes)+1}", "points": pts,
+                                       "global_points": global_pts,
+                                       "other_data": dict(od), "plate_bbox": [x, y, w, h]})
+                    elif re.match(r"^source_\d+$", label):
+                        global_pts = [[float(p.x()), float(p.y())] for p in s.points]
+                        pts = [[p.x() - x1, p.y() - y1] for p in s.points]
+                        shapes.append({"label": label, "display_label": f"s{len(shapes)+1}", "points": pts,
+                                       "global_points": global_pts,
+                                       "other_data": dict(od), "plate_bbox": [x, y, w, h]})
+
+            # Sort tracks & sources by bottom-x
+            def _bottom_x(d):
+                pts = d["points"]
+                if not pts:
+                    return 0
+                max_y = max(p[1] for p in pts)
+                return min(p[0] for p in pts if p[1] == max_y)
+
+            tracks = sorted([s for s in shapes if s["label"].startswith("track_")], key=_bottom_x)
+            sources = sorted([s for s in shapes if s["label"].startswith("source_")], key=_bottom_x)
+
+            # Renumber
+            final_shapes = []
+            for i, t in enumerate(tracks, 1):
+                final_shapes.append({**t, "label": f"track_{i}", "display_label": f"t{i}"})
+            for i, s in enumerate(sources, 1):
+                final_shapes.append({**s, "label": f"source_{i}", "display_label": f"s{i}"})
+            if bg_strips:
+                final_shapes.append(bg_strips[0])  # only 1 bg strip
+
+            plates_data.append({
+                "plate_id": pid,
+                "crop_rgb": crop_rgb,
+                "shapes": final_shapes,
+                "bbox": [x, y, w, h],
+            })
+
+        self._show_plate_dialog(plates_data)
+
+    def _show_plate_dialog(self, plates_data):
+        """Create and show the plate popup with the given plates_data."""
+        if not plates_data:
+            return
+        try:
+            from anylabeling.views.labeling.widgets.plate_panel import PlateDialog
+            if hasattr(self, "_plate_dialog") and self._plate_dialog is not None:
+                self._plate_dialog.close()
+            self._plate_dialog = PlateDialog(plates_data, None, image_path=self.image_path)
+            self._plate_dialog.finished.connect(lambda: setattr(self, "_plate_dialog", None))
+            self._plate_dialog.show()
+        except Exception as e:
+            import traceback
+            logger.error(f"PlateDialog error: {e}\n{traceback.format_exc()}")
 
     def copy_shape(self):
         self.canvas.end_move(copy=True)

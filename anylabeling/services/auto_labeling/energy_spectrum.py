@@ -47,6 +47,65 @@ def centerline_to_band_polygon(centerline, half_width):
     return left + list(reversed(right))
 
 
+def _offset_centerline(centerline, offset):
+    """Offset each point of a centerline along its normal direction.
+
+    Positive offset = right side, negative = left side.
+    """
+    n = len(centerline)
+    result = []
+    for i in range(n):
+        cx, cy = centerline[i]
+        if i == 0:
+            dx = centerline[1][0] - cx
+            dy = centerline[1][1] - cy
+        elif i == n - 1:
+            dx = cx - centerline[-2][0]
+            dy = cy - centerline[-2][1]
+        else:
+            dx = centerline[i + 1][0] - centerline[i - 1][0]
+            dy = centerline[i + 1][1] - centerline[i - 1][1]
+        length = (dx * dx + dy * dy) ** 0.5
+        if length < 1e-6:
+            result.append((cx, cy))
+            continue
+        nx, ny = -dy / length, dx / length
+        if i == 0 or i == n - 1:
+            ny = 0.0
+            nx = 1.0 if nx > 0 else -1.0
+        result.append((cx + nx * offset, cy + ny * offset))
+    return result
+
+
+def _extend_centerline_y(centerline, y_min, y_max):
+    """Extend first/last point along tangent to cover [y_min, y_max]."""
+    if len(centerline) < 2:
+        return centerline
+    cl = list(centerline)
+
+    # Start point: extend backwards toward y_min
+    dx = cl[1][0] - cl[0][0]
+    dy = cl[1][1] - cl[0][1]
+    length = (dx * dx + dy * dy) ** 0.5
+    if length > 1e-6 and abs(dy) > 1e-6:
+        tx, ty = dx / length, dy / length
+        t = (cl[0][1] - y_min) / ty
+        if t > 0:
+            cl[0] = (cl[0][0] - t * tx, cl[0][1] - t * ty)
+
+    # End point: extend forward toward y_max
+    dx = cl[-1][0] - cl[-2][0]
+    dy = cl[-1][1] - cl[-2][1]
+    length = (dx * dx + dy * dy) ** 0.5
+    if length > 1e-6 and abs(dy) > 1e-6:
+        tx, ty = dx / length, dy / length
+        t = (y_max - cl[-1][1]) / ty
+        if t > 0:
+            cl[-1] = (cl[-1][0] + t * tx, cl[-1][1] + t * ty)
+
+    return cl
+
+
 def get_band_polygon(shape):
     pts = shape.get("points", [])
     if not pts:
@@ -117,13 +176,15 @@ def group_by_plate(shapes):
 
         if pid is not None:
             if pid not in known:
-                known[pid] = {"tracks": [], "sources": [], "bbox": bbox}
+                known[pid] = {"tracks": [], "sources": [], "background": None, "bbox": bbox}
             elif bbox and known[pid]["bbox"] is None:
                 known[pid]["bbox"] = bbox
             if label.startswith("track"):
                 known[pid]["tracks"].append(s)
             elif label.startswith("source"):
                 known[pid]["sources"].append(s)
+            elif (s.get("other_data") or {}).get("_is_bg_strip"):
+                known[pid]["background"] = s
         else:
             orphans.append(s)
 
@@ -139,18 +200,23 @@ def group_by_plate(shapes):
                     pd["tracks"].append(s)
                 elif label.startswith("source"):
                     pd["sources"].append(s)
+                elif (s.get("other_data") or {}).get("_is_bg_strip"):
+                    pd["background"] = s
                 assigned = True
                 break
         if not assigned:
             pid = -1
             if pid not in known:
-                known[pid] = {"tracks": [], "sources": [], "bbox": None}
+                known[pid] = {"tracks": [], "sources": [], "background": None, "bbox": None}
             if label.startswith("track"):
                 known[pid]["tracks"].append(s)
             elif label.startswith("source"):
                 known[pid]["sources"].append(s)
+            elif (s.get("other_data") or {}).get("_is_bg_strip"):
+                known[pid]["background"] = s
 
-    return {pid: {"tracks": p["tracks"], "sources": p["sources"]}
+    return {pid: {"tracks": p["tracks"], "sources": p["sources"],
+                  "background": p.get("background")}
             for pid, p in known.items()}
 
 
@@ -257,8 +323,44 @@ def compute_spectra(image_path, shapes, output_dir, scale=1.0, smooth=3,
                     x = 0.0
             print(f"  [{ti}] {track.get('label','?')} bottom_x={x:.0f}")
 
+        # ── Shared background strip for this plate ──
+        bg_shape = pd.get("background")
+        bg_cl = None
+        bg_tw = 10
+        bg_gap = 30.0
+        bg_side = 1.0
+        if bg_shape:
+            od = bg_shape.get("other_data") or {}
+            bg_cl = bg_shape.get("centerline") or od.get("centerline")
+            bg_tw = bg_shape.get("track_width") or od.get("track_width", 10)
+            bg_gap = bg_shape.get("bg_gap") or od.get("bg_gap", 30.0)
+            bg_side = bg_shape.get("bg_side") or od.get("bg_side", 1.0)
+
         for ti, track in enumerate(pd["tracks"]):
-            band = get_band_polygon(track)
+            if bg_cl and len(bg_cl) >= 2:
+                # ── Adapted shared background ──
+                # Background width = track's own band width (inherited)
+                track_od = track.get("other_data") or {}
+                tw = track.get("track_width") or track_od.get("track_width", 10)
+                track_hw = tw / 2.0
+
+                # Track's band Y range (from its own band polygon)
+                track_band = get_band_polygon(track)
+                if len(track_band) < 3:
+                    continue
+                track_band_np = np.array(track_band, dtype=np.float64)
+                track_y_min = float(track_band_np[:, 1].min())
+                track_y_max = float(track_band_np[:, 1].max())
+
+                # Extend background centerline Y range to cover track's Y range
+                extended_cl = _extend_centerline_y(bg_cl, track_y_min, track_y_max)
+
+                # Generate band polygon with TRACK's width at BACKGROUND's position
+                band = centerline_to_band_polygon(extended_cl, track_hw)
+            else:
+                # Fallback: use track's own band polygon
+                band = get_band_polygon(track)
+
             if len(band) < 3:
                 continue
 

@@ -1,5 +1,0 @@
-﻿type: track_centerline
-name: track_centerline_r18
-provider: Local
-display_name: Track Centerline (ResNet18)
-model_path: D:/desk/data/log/checkpoints/best_model.pth

@@ -2252,66 +2252,6 @@ class ModelManager(QObject):
                     f"❌ Error in loading model: {model_config['type']} with error: {str(e)}"
                 )
                 return
-        elif model_config["type"] == "track_centerline":
-            from .track_centerline import TrackCenterline
-
-            try:
-                model_config["model"] = TrackCenterline(
-                    model_config, on_message=self.new_model_status.emit
-                )
-                self.auto_segmentation_model_unselected.emit()
-                logger.info(
-                    f"Model loaded successfully: {model_config['type']}"
-                )
-            except Exception as e:
-                template = "Error in loading model: {error_message}"
-                translated_template = self.tr(template)
-                error_text = translated_template.format(error_message=str(e))
-                self.new_model_status.emit(error_text)
-                logger.error(
-                    f"Error in loading model: {model_config['type']} with error: {str(e)}"
-                )
-                return
-        elif model_config["type"] == "track_centerline_light":
-            from .track_centerline_light import TrackCenterlineLight
-
-            try:
-                model_config["model"] = TrackCenterlineLight(
-                    model_config, on_message=self.new_model_status.emit
-                )
-                self.auto_segmentation_model_unselected.emit()
-                logger.info(
-                    f"Model loaded successfully: {model_config['type']}"
-                )
-            except Exception as e:
-                template = "Error in loading model: {error_message}"
-                translated_template = self.tr(template)
-                error_text = translated_template.format(error_message=str(e))
-                self.new_model_status.emit(error_text)
-                logger.error(
-                    f"Error in loading model: {model_config['type']} with error: {str(e)}"
-                )
-                return
-        elif model_config["type"] == "track_instance_seg":
-            from .track_instance_seg import TrackInstanceSeg
-
-            try:
-                model_config["model"] = TrackInstanceSeg(
-                    model_config, on_message=self.new_model_status.emit
-                )
-                self.auto_segmentation_model_unselected.emit()
-                logger.info(
-                    f"Model loaded successfully: {model_config['type']}"
-                )
-            except Exception as e:
-                template = "Error in loading model: {error_message}"
-                translated_template = self.tr(template)
-                error_text = translated_template.format(error_message=str(e))
-                self.new_model_status.emit(error_text)
-                logger.error(
-                    f"Error in loading model: {model_config['type']} with error: {str(e)}"
-                )
-                return
         elif model_config["type"] == "track_mask2former":
             from .track_mask2former import TrackMask2Former
 
@@ -2429,46 +2369,37 @@ class ModelManager(QObject):
             model.set_auto_labeling_filter_classes(class_names)
 
     def set_auto_labeling_min_track_length(self, value):
-        """Set minimum track length for track_centerline models."""
+        """Set minimum track length."""
         if self.loaded_model_config is not None:
             model = self.loaded_model_config.get("model")
             if model and hasattr(model, "set_auto_labeling_min_track_length"):
                 model.set_auto_labeling_min_track_length(value)
 
     def set_auto_labeling_keypoint_interval(self, value):
-        """Set keypoint sampling interval for track_centerline models."""
+        """Set keypoint sampling interval."""
         if self.loaded_model_config is not None:
             model = self.loaded_model_config.get("model")
             if model and hasattr(model, "set_auto_labeling_keypoint_interval"):
                 model.set_auto_labeling_keypoint_interval(value)
 
     def set_auto_labeling_track_width(self, value):
-        """Set default track width for track_centerline band expansion."""
+        """Set default track width for band expansion."""
         if self.loaded_model_config is not None:
             model = self.loaded_model_config.get("model")
             if model and hasattr(model, "set_auto_labeling_track_width"):
                 model.set_auto_labeling_track_width(value)
 
-    def set_auto_labeling_arc_residual(self, enabled: bool):
-        """Enable / disable arc-residual split-merge refinement."""
-        if self.loaded_model_config is not None:
-            model = self.loaded_model_config.get("model")
-            if model and hasattr(model, "set_auto_labeling_arc_residual"):
-                model.set_auto_labeling_arc_residual(enabled)
+    def recompute_background_strips(self, shapes, H, W):
+        """Recompute background strips after manual track addition.
 
-    def set_auto_labeling_arc_split_nrmse(self, value: float):
-        """Set arc-residual split NRMSE threshold."""
+        Delegates to the loaded model (track_mask2former).
+        Returns (new_bg_shapes, old_bg_shapes_to_remove).
+        """
         if self.loaded_model_config is not None:
             model = self.loaded_model_config.get("model")
-            if model and hasattr(model, "set_auto_labeling_arc_split_nrmse"):
-                model.set_auto_labeling_arc_split_nrmse(value)
-
-    def set_auto_labeling_arc_merge_nrmse(self, value: float):
-        """Set arc-residual merge NRMSE threshold."""
-        if self.loaded_model_config is not None:
-            model = self.loaded_model_config.get("model")
-            if model and hasattr(model, "set_auto_labeling_arc_merge_nrmse"):
-                model.set_auto_labeling_arc_merge_nrmse(value)
+            if model and hasattr(model, "recompute_background_strips"):
+                return model.recompute_background_strips(shapes, H, W)
+        return [], []
 
     def unload_model(self):
         """Unload model"""

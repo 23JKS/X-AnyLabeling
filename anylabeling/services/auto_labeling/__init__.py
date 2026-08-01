@@ -90,7 +90,6 @@ _CUSTOM_MODELS = [
     "ppocr_v5",
     "ppocr_v6",
     "deimv2",
-    "track_instance_seg",
 ]
 
 
@@ -259,7 +258,6 @@ _AUTO_LABELING_CONF_MODELS = [
     "u_rtdetr",
     "yoloe",
     "grounding_sam2",
-    "track_instance_seg",
 ]
 
 
@@ -369,7 +367,6 @@ _AUTO_LABELING_PRESERVE_EXISTING_ANNOTATIONS_STATE_MODELS = [
     "u_rtdetr",
     "yoloe",
     "segment_anything_2_video",
-    "track_instance_seg",
 ]
 
 
