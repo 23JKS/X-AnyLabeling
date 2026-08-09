@@ -7,6 +7,7 @@ from anylabeling.config import get_config
 
 from PyQt6 import uic
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot, QPoint, QPointF, QTimer
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
@@ -439,7 +440,8 @@ class AutoLabelingWidget(QWidget):
             self._on_shape_selected
         )
 
-        # ---- Detect Plates button (for track_mask2former) ----
+        # ---- Detect Plates + Draw Background buttons (for track_mask2former) ----
+        # 放在同一行（水平布局）
         self.button_detect_plates = QPushButton(self.tr("检测Plate"))
         self.button_detect_plates.setToolTip(
             self.tr("对当前图片检测Plate区域并显示各Plate子图")
@@ -447,9 +449,6 @@ class AutoLabelingWidget(QWidget):
         self.button_detect_plates.clicked.connect(
             self._on_detect_plates
         )
-        self.verticalLayout.addWidget(self.button_detect_plates)
-
-        # ---- Draw Background button (for track_mask2former) ----
         self.button_draw_background = QPushButton(self.tr("绘制背景"))
         self.button_draw_background.setToolTip(
             self.tr("根据当前plate标注情况，为每条plate绘制背景条带")
@@ -457,7 +456,12 @@ class AutoLabelingWidget(QWidget):
         self.button_draw_background.clicked.connect(
             self._on_draw_background
         )
-        self.verticalLayout.addWidget(self.button_draw_background)
+        self._plate_btn_layout = QHBoxLayout()
+        self._plate_btn_layout.setContentsMargins(0, 0, 0, 0)
+        self._plate_btn_layout.setSpacing(6)
+        self._plate_btn_layout.addWidget(self.button_detect_plates)
+        self._plate_btn_layout.addWidget(self.button_draw_background)
+        self.verticalLayout.addLayout(self._plate_btn_layout)
 
         # ===================================
         #  End of Auto labeling buttons
@@ -1985,9 +1989,11 @@ class AutoLabelingWidget(QWidget):
                         bs.other_data["track_width"] = w
                         bs.line_color = s.line_color
                         bs.fill_color = s.fill_color
+                        bs.select_line_color = QColor(0, 255, 0, 255)
                         bs.fill = True
                         for x, y in band_pts:
                             bs.add_point(QPointF(x, y))
+                        bs.close()  # band polygon: must be closed (top edge)
                         self._band_shapes.append(bs)
                 elif (s.other_data.get("_is_bg_strip")
                       and s.shape_type in ("linestrip", "line")
@@ -2009,9 +2015,11 @@ class AutoLabelingWidget(QWidget):
                     bs.other_data["plate_id"] = s.other_data.get("plate_id")
                     bs.line_color = s.line_color
                     bs.fill_color = s.fill_color
+                    bs.select_line_color = QColor(0, 255, 0, 255)
                     bs.fill = True
                     for x, y in band_pts:
                         bs.add_point(QPointF(x, y))
+                    bs.close()  # band polygon: must be closed (top edge)
                     self._band_shapes.append(bs)
                 else:
                     kept.append(s)

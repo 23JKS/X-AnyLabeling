@@ -15,7 +15,7 @@ auto_highlight_shape: true
 auto_switch_to_edit_mode: true
 exif_scan_enabled: true
 show_groups: false
-show_masks: true
+show_masks: false
 show_texts: true
 show_labels: true
 show_scores: true

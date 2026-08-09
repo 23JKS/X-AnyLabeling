@@ -271,6 +271,15 @@ def compute_track_spectrum(
     """
     h, w = ip_image.shape
 
+    # --- Guard: energy origin is meaningless without a valid source_y -----
+    # R→E dispersion is measured FROM the source centroid; source_y must be
+    # a real, positive pixel coordinate. 0.0 (the old default when no source
+    # was found) silently produced a spurious spectrum — refuse it here too.
+    if source_y is None or not np.isfinite(source_y) or source_y <= 0.0:
+        _dbg(f"[spectrum] INVALID source_y={source_y!r} — cannot determine "
+             "energy origin, aborting")
+        return None
+
     # --- R→E function -----------------------------------------------------
     if r_to_e_func is None:
         def _r2e(r_pixel):
@@ -417,7 +426,7 @@ def compute_track_spectrum(
     row_area_mm2 = row_widths_pixels * pixel_area_mm2
     PSL_mm2 = PSL_net / row_area_mm2
     # 不除以面积
-    PSL_mm2 = PSL_net
+    # PSL_mm2 = PSL_net
     # Debug: dump per-row PSL to file (only for normal run, not skip_bg)
     if not skip_bg:
         _bg_arr = locals().get("PSL_bg_interp", None)

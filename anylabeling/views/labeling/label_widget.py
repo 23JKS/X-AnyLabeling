@@ -3913,6 +3913,9 @@ class LabelingWidget(LabelDialog):
         shape.difficult = difficult
         shape.kie_linking = kie_linking
 
+        if text in ("track", "source"):
+            self._renumber_tracks_and_sources()
+
         # Add to label history
         self.label_dialog.add_label_history(shape.label)
 
@@ -4745,16 +4748,23 @@ class LabelingWidget(LabelDialog):
         label_file = LabelFile()
         # Get current shapes
         # Excluding auto labeling special shapes
-        shapes = [
-            item.shape().to_dict()
-            for item in self.label_list
-            if item.shape().label
-            not in [
+        shapes = []
+        for item in self.label_list:
+            shape = item.shape()
+            if shape.label in [
                 AutoLabelingMode.OBJECT,
                 AutoLabelingMode.ADD,
                 AutoLabelingMode.REMOVE,
-            ]
-        ]
+            ]:
+                continue
+            # In band mode, save the centerline shape instead of the band
+            # polygon. The band polygon holds an object reference in _cl_ref
+            # that cannot be serialized to JSON.
+            if shape.other_data.get("_is_band"):
+                cl_ref = shape.other_data.get("_cl_ref")
+                if cl_ref is not None:
+                    shape = cl_ref
+            shapes.append(shape.to_dict())
         flags = {}
         for i in range(self.flag_widget.count()):
             item = self.flag_widget.item(i)
@@ -6290,7 +6300,10 @@ class LabelingWidget(LabelDialog):
             max_y = max(p.y() for p in pts)
             return min(p.x() for p in pts if p.y() == max_y)
         tracks.sort(key=_bottom_x)
-        sources.sort(key=_bottom_x)
+        sources.sort(key=lambda s: (
+            sum(p.x() for p in s.points) / len(s.points)
+            if s.points else 0.0
+        ))
 
         # 重新编号
         for i, s in enumerate(tracks, 1):
@@ -6301,6 +6314,11 @@ class LabelingWidget(LabelDialog):
             new_label = f"source_{i}"
             if s.label != new_label:
                 s.label = new_label
+
+        for s in tracks + sources:
+            item = self.label_list.find_item_by_shape(s)
+            if item is not None:
+                item.setText(s.label)
 
         # 为手动绘制（无 centerline 数据）的 track 补齐 other_data
         for s in tracks:
@@ -6361,6 +6379,8 @@ class LabelingWidget(LabelDialog):
                     bg_s.points = [QtCore.QPointF(x, y) for x, y in band_pts]
                     bg_s.shape_type = "polygon"
                     bg_s.other_data["_is_band"] = True
+                    bg_s.select_line_color = QtGui.QColor(0, 255, 0, 255)
+                    bg_s.close()  # band polygon: must be closed (top edge)
                     aw._band_shapes.append(bg_s)
                 else:
                     # Show as centerline linestrip
@@ -6500,6 +6520,7 @@ class LabelingWidget(LabelDialog):
                             pts = [[p.x() - x1, p.y() - y1] for p in s.points]
                         bg_strips.append({"label": "background", "display_label": "bg", "points": pts,
                                            "global_points": global_pts,
+                                           "global_centerline": [[float(cx), float(cy)] for cx, cy in cl],
                                            "other_data": dict(od), "plate_bbox": [x, y, w, h]})
                     elif re.match(r"^track_\d+$", label):
                         # Compute ribbon polygon from centerline + width

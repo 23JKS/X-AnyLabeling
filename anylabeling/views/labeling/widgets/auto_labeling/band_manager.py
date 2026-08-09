@@ -52,8 +52,10 @@ class BandManager:
         bs.line_color = line_color
         bs.fill_color = fill_color
         bs.fill = True
+        bs.select_line_color = QColor(0, 255, 0, 255)
         for x, y in pts:
             bs.add_point(QPointF(x, y))
+        bs.close()  # band polygon: must be closed (top edge)
         return bs
 
     def on_shape_selected(self, shapes, spinbox):

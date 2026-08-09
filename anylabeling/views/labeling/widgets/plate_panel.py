@@ -131,21 +131,38 @@ class PlateThumbnail(QtWidgets.QWidget):
         # Draw shapes
         for i, s in enumerate(self.shapes):
             pts = s["points"]
-            if len(pts) < 2:
+            if len(pts) < 1:
                 continue
             label = s.get("label", "")
             color = _color_for_label(label)
 
-            # Fill
-            fill = QtGui.QColor(color.red(), color.green(), color.blue(), 50)
+            if label.startswith("source"):
+                cx = sum(x for x, _ in pts) / len(pts)
+                cy = sum(y for _, y in pts) / len(pts)
+                radius = max(3, 4)
+                p.setPen(QtGui.QPen(color, 2))
+                p.setBrush(QtGui.QColor(
+                    color.red(), color.green(), color.blue(), 180))
+                p.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
+                p.setPen(QtGui.QColor(255, 255, 255))
+                font = QtGui.QFont("Segoe UI", 9)
+                font.setBold(True)
+                p.setFont(font)
+                fm2 = QtGui.QFontMetrics(font)
+                text = s.get("display_label", label)
+                tw2 = fm2.horizontalAdvance(text)
+                p.drawText(
+                    QtCore.QRectF(cx - tw2 / 2 - 2, cy - 8, tw2 + 4, 16),
+                    QtCore.Qt.AlignmentFlag.AlignCenter,
+                    text,
+                )
+                continue
+
             path = QtGui.QPainterPath()
             path.moveTo(QtCore.QPointF(pts[0][0], pts[0][1]))
             for x, y in pts[1:]:
                 path.lineTo(QtCore.QPointF(x, y))
             path.closeSubpath()
-            p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.setBrush(fill)
-            p.drawPath(path)
 
             # Outline
             pen2 = QtGui.QPen(color)
@@ -648,7 +665,7 @@ class PlateDialog(QtWidgets.QDialog):
         """Redraw the current pixmap scaled to fit a target viewport
         (TARGET_W × TARGET_H) multiplied by zoom, maintaining aspect ratio."""
         TARGET_W = 400
-        TARGET_H = 900
+        TARGET_H = 600
 
         pd = self._plates_data[self._index]
         crop = pd["crop_rgb"]
@@ -686,19 +703,41 @@ class PlateDialog(QtWidgets.QDialog):
             if not self._visible_labels.get(label, True):
                 continue
             pts = s["points"]
-            if len(pts) < 2:
+            if len(pts) < 1:
                 continue
             color = _color_for_label(label)
 
-            fill = QtGui.QColor(color.red(), color.green(), color.blue(), 50)
+            if label.startswith("source"):
+                cx = sum(x for x, _ in pts) / len(pts)
+                cy = sum(y for _, y in pts) / len(pts)
+                radius = max(3, int(4 * scale))
+                painter.setPen(QtGui.QPen(color, max(1, int(2 * scale))))
+                painter.setBrush(QtGui.QColor(
+                    color.red(), color.green(), color.blue(), 180))
+                painter.drawEllipse(
+                    QtCore.QPointF(cx * scale, cy * scale), radius, radius)
+                painter.setPen(QtGui.QColor(255, 255, 255))
+                fs = max(8, int(9 * scale))
+                font = QtGui.QFont("Segoe UI", fs)
+                font.setBold(True)
+                painter.setFont(font)
+                fm = QtGui.QFontMetrics(font)
+                text = s.get("display_label", label)
+                tw = fm.horizontalAdvance(text)
+                painter.drawText(
+                    QtCore.QRectF(cx * scale - tw / 2 - 3,
+                                  cy * scale - fm.height() / 2,
+                                  tw + 6, fm.height()),
+                    QtCore.Qt.AlignmentFlag.AlignCenter,
+                    text,
+                )
+                continue
+
             path = QtGui.QPainterPath()
             path.moveTo(QtCore.QPointF(pts[0][0] * scale, pts[0][1] * scale))
             for x, y in pts[1:]:
                 path.lineTo(QtCore.QPointF(x * scale, y * scale))
             path.closeSubpath()
-            painter.setPen(QtCore.Qt.PenStyle.NoPen)
-            painter.setBrush(fill)
-            painter.drawPath(path)
 
             pen = QtGui.QPen(color)
             pen.setWidth(max(1, int(2 * scale)))
@@ -1047,16 +1086,36 @@ class PlateDialog(QtWidgets.QDialog):
         from anylabeling.services.auto_labeling.spectrum import (
             compute_track_spectrum, save_spectrum_csv, save_spectrum_plot)
 
-        # Find source centroid Y (origin for R→E dispersion)
-        source_y = 0.0
-        for s in pd["shapes"]:
-            if s["label"].startswith("source"):
-                pts = s.get("global_points") or s.get("points", [])
-                if pts:
-                    source_y = float(np.mean([p[1] for p in pts]))
-                    if not s.get("global_points"):
-                        source_y += offset_y
-                    break
+        # Find source centroid Y (origin for R→E dispersion).
+        # Each plate must have EXACTLY ONE source; 0 or >1 sources
+        # means we cannot determine the energy origin → refuse to compute.
+        sources_in_plate = [
+            s for s in pd["shapes"] if s["label"].startswith("source")
+        ]
+        if len(sources_in_plate) == 0:
+            QtWidgets.QMessageBox.warning(
+                self, "提示",
+                "当前 plate 没有 source，无法确定能量原点，"
+                "不能绘制能谱图。\n请先为该 plate 标注一个 source。")
+            return
+        if len(sources_in_plate) > 1:
+            QtWidgets.QMessageBox.warning(
+                self, "提示",
+                f"当前 plate 有 {len(sources_in_plate)} 个 source，"
+                "每个 plate 只能有一个 source，无法确定能量原点，"
+                "不能绘制能谱图。\n请删除多余的 source 标注。")
+            return
+
+        _src = sources_in_plate[0]
+        _src_pts = _src.get("global_points") or _src.get("points", [])
+        if not _src_pts:
+            QtWidgets.QMessageBox.warning(
+                self, "提示",
+                "当前 plate 的 source 没有坐标，无法计算能谱。")
+            return
+        source_y = float(np.mean([p[1] for p in _src_pts]))
+        if not _src.get("global_points"):
+            source_y += offset_y
 
         done, errs = 0, []
         for label in checked:
@@ -1099,6 +1158,7 @@ class PlateDialog(QtWidgets.QDialog):
                     else:
                         bg_cl = (
                             bg_od.get("centerline")
+                            or bg_shape.get("global_centerline")
                             or bg_shape.get("global_points")
                             or _global_pts(bg_shape)
                         )
@@ -1113,6 +1173,7 @@ class PlateDialog(QtWidgets.QDialog):
                 else:
                     bg_cl = (
                         bg_od.get("centerline")
+                        or bg_shape.get("global_centerline")
                         or bg_shape.get("global_points")
                         or _global_pts(bg_shape)
                     )

@@ -160,6 +160,7 @@ class Canvas(
         self.snapping = True
         self.h_shape_is_selected = False
         self.h_shape_is_hovered = None
+        self._band_hover_auto_selected = False  # hover 自动选中的 band，离开时需取消
         self.allowed_oop_shape_types = ["rotation", "quadrilateral", "cuboid"]
         default_cuboid_depth_vector = self.cuboid_config.get(
             "default_depth_vector", [24.0, -24.0]
@@ -184,7 +185,7 @@ class Canvas(
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.WheelFocus)
         self.show_groups = False
-        self.show_masks = True
+        self.show_masks = False
         self.show_texts = True
         self.show_labels = True
         self.show_scores = True
@@ -1242,9 +1243,17 @@ class Canvas(
 
         if prev_hover_shape != self.h_shape:
             self.shape_hover_changed.emit()
-            # Auto-select band polygon on hover enter
-            if self.h_shape is not None and self.h_shape.other_data.get("_is_band"):
+            # Auto-select band polygon on hover enter / deselect on hover leave
+            if (
+                self.h_shape is not None
+                and self.h_shape.other_data.get("_is_band")
+            ):
+                self._band_hover_auto_selected = True
                 self.selection_changed.emit([self.h_shape])
+            elif self._band_hover_auto_selected:
+                # Mouse left the band polygon: restore original look & deselect
+                self._band_hover_auto_selected = False
+                self.selection_changed.emit([])
 
     def add_point_to_edge(self):
         """Add a point to current shape"""
@@ -1532,6 +1541,9 @@ class Canvas(
                     ev.modifiers()
                     == QtCore.Qt.KeyboardModifier.ControlModifier
                 )
+                # A real click means the user intentionally selected the
+                # shape → don't auto-deselect it when the mouse moves away.
+                self._band_hover_auto_selected = False
                 self.select_shape_point(
                     pos, multiple_selection_mode=group_mode
                 )
@@ -1779,6 +1791,27 @@ class Canvas(
                     shape_selectable = (
                         front_path is not None and front_path.contains(point)
                     )
+                elif (
+                    self.is_visible(shape)
+                    and shape.label.startswith("source")
+                    and len(shape.points) > 0
+                ):
+                    cx = sum(p.x() for p in shape.points) / len(shape.points)
+                    cy = sum(p.y() for p in shape.points) / len(shape.points)
+                    hit_radius = max(
+                        self.epsilon * 3 / self.scale,
+                        6.0 / self.scale,
+                    )
+                    shape_selectable = (
+                        math.hypot(point.x() - cx, point.y() - cy)
+                        <= hit_radius
+                    )
+                    if (
+                        not shape_selectable
+                        and len(shape.points) > 1
+                        and shape.contains_point(point)
+                    ):
+                        shape_selectable = True
                 elif (
                     self.is_visible(shape)
                     and len(shape.points) > 1
@@ -2632,6 +2665,15 @@ class Canvas(
             for shape in self.shapes:
                 if not shape.visible:
                     continue
+                if shape.label.startswith("source"):
+                    continue
+                if (
+                    shape.other_data.get("_is_bg_strip")
+                    or shape.label == "background"
+                ):
+                    continue
+                if shape.other_data.get("_is_band"):
+                    continue
                 if shape.shape_type not in [
                     "polygon",
                     "rectangle",
@@ -2738,6 +2780,22 @@ class Canvas(
                     and (shape.selected or shape == self.h_shape)
                     and not (self.selected_vertex() and self.moving_shape)
                 )
+                if shape.label.startswith("source") and shape.points:
+                    cx = sum(p.x() for p in shape.points) / len(shape.points)
+                    cy = sum(p.y() for p in shape.points) / len(shape.points)
+                    radius = max(3.0, 6.0 / Shape.scale)
+                    p.setPen(QtGui.QPen(
+                        shape.line_color,
+                        max(1, int(round(2.0 / Shape.scale))),
+                    ))
+                    p.setBrush(QtGui.QColor(
+                        shape.line_color.red(),
+                        shape.line_color.green(),
+                        shape.line_color.blue(),
+                        180,
+                    ))
+                    p.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
+                    continue
                 shape.paint(p)
 
             if (
@@ -2821,7 +2879,23 @@ class Canvas(
                 p.drawLine(QtCore.QLineF(self.line[1], self.current.points[0]))
         if self.selected_shapes_copy:
             for s in self.selected_shapes_copy:
-                s.paint(p)
+                if s.label.startswith("source") and s.points:
+                    cx = sum(pt.x() for pt in s.points) / len(s.points)
+                    cy = sum(pt.y() for pt in s.points) / len(s.points)
+                    radius = max(3.0, 6.0 / Shape.scale)
+                    p.setPen(QtGui.QPen(
+                        s.line_color,
+                        max(1, int(round(2.0 / Shape.scale))),
+                    ))
+                    p.setBrush(QtGui.QColor(
+                        s.line_color.red(),
+                        s.line_color.green(),
+                        s.line_color.blue(),
+                        180,
+                    ))
+                    p.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
+                else:
+                    s.paint(p)
 
         if (
             self.fill_drawing()

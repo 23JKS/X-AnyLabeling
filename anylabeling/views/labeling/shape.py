@@ -423,6 +423,12 @@ class Shape:
             if self.difficult and self.shape_type != "point":
                 pen.setStyle(QtCore.Qt.PenStyle.DashLine)
             painter.setPen(pen)
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            is_centerline = (
+                self.shape_type == "linestrip"
+                or self.other_data.get("_is_bg_strip")
+                or self.label == "background"
+            )
 
             line_path = QtGui.QPainterPath()
             vrtx_path = QtGui.QPainterPath()
@@ -560,7 +566,11 @@ class Shape:
                     line_path.lineTo(p)
                     if self.selected and not self.other_data.get("_is_band"):
                         self.draw_vertex(vrtx_path, i)
-                if self.is_closed():
+                # Band polygons (incl. bg bands which carry _is_bg_strip →
+                # is_centerline=True) must always draw their closing edge.
+                if (self.is_closed() and not is_centerline) or self.other_data.get(
+                    "_is_band"
+                ):
                     line_path.lineTo(self.points[0])
 
             painter.drawPath(line_path)
@@ -587,14 +597,17 @@ class Shape:
                 painter.drawEllipse(
                     QtCore.QPointF(p0.x(), p0.y()), d / 2.0, d / 2.0
                 )
-            if self.fill:
+            if (
+                self.fill
+                and (not is_centerline or self.selected)
+                and (not self.other_data.get("_is_band") or self.selected)
+            ):
                 color = (
                     self.select_fill_color
                     if self.selected
                     else self.fill_color
                 )
                 painter.fillPath(line_path, color)
-
             if (
                 self.shape_type == "quadrilateral"
                 and len(self.points) == 4
