@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QSpinBox,
     QWidget,
 )
 
@@ -33,6 +34,7 @@ from anylabeling.views.labeling.utils.theme import get_theme
 from anylabeling.views.labeling.utils.style import (
     get_lineedit_style,
     get_double_spinbox_style,
+    get_spinbox_style,
     get_normal_button_style,
     get_highlight_button_style,
     get_settings_combo_style,
@@ -456,11 +458,56 @@ class AutoLabelingWidget(QWidget):
         self.button_draw_background.clicked.connect(
             self._on_draw_background
         )
+        self.button_fine_tune = QPushButton(self.tr("微调模型"))
+        self.button_fine_tune.setToolTip(
+            self.tr("使用目录中所有已检查(✓)的图片微调Mask2Former模型")
+        )
+        self.button_fine_tune.clicked.connect(
+            self._on_fine_tune
+        )
+
+        # ---- Fine-tune parameters (epochs + train/val split) ----
+        # 放在“微调模型”按钮的右侧（同一水平行）
+        self.input_fine_tune_epochs = QLabel(self.tr("轮数"))
+        self.input_fine_tune_epochs.setStyleSheet(
+            f"color: {get_theme()['text_secondary']}; "
+            f"background: transparent; border: none;"
+        )
+        self.edit_fine_tune_epochs = QSpinBox()
+        self.edit_fine_tune_epochs.setRange(1, 200)
+        self.edit_fine_tune_epochs.setValue(3)
+        self.edit_fine_tune_epochs.setToolTip(
+            self.tr("微调训练的轮数(epoch)")
+        )
+        self.edit_fine_tune_epochs.setStyleSheet(get_spinbox_style())
+
+        self.input_fine_tune_split = QLabel(self.tr("训练集比例"))
+        self.input_fine_tune_split.setStyleSheet(
+            f"color: {get_theme()['text_secondary']}; "
+            f"background: transparent; border: none;"
+        )
+        self.edit_fine_tune_split = QSpinBox()
+        self.edit_fine_tune_split.setRange(10, 95)
+        self.edit_fine_tune_split.setValue(80)
+        self.edit_fine_tune_split.setSuffix("%")
+        self.edit_fine_tune_split.setToolTip(
+            self.tr("训练集占总样本的比例，其余作为测试集")
+        )
+        self.edit_fine_tune_split.setStyleSheet(get_spinbox_style())
+
         self._plate_btn_layout = QHBoxLayout()
         self._plate_btn_layout.setContentsMargins(0, 0, 0, 0)
         self._plate_btn_layout.setSpacing(6)
         self._plate_btn_layout.addWidget(self.button_detect_plates)
         self._plate_btn_layout.addWidget(self.button_draw_background)
+        self._plate_btn_layout.addWidget(self.button_fine_tune)
+        self._plate_btn_layout.addSpacing(8)
+        self._plate_btn_layout.addWidget(self.input_fine_tune_epochs)
+        self._plate_btn_layout.addWidget(self.edit_fine_tune_epochs)
+        self._plate_btn_layout.addSpacing(8)
+        self._plate_btn_layout.addWidget(self.input_fine_tune_split)
+        self._plate_btn_layout.addWidget(self.edit_fine_tune_split)
+        self._plate_btn_layout.addStretch()
         self.verticalLayout.addLayout(self._plate_btn_layout)
 
         # ===================================
@@ -1132,6 +1179,11 @@ class AutoLabelingWidget(QWidget):
             self.button_toggle_band.hide()
             self.button_detect_plates.hide()
             self.button_draw_background.hide()
+            self.button_fine_tune.hide()
+            self.input_fine_tune_epochs.hide()
+            self.edit_fine_tune_epochs.hide()
+            self.input_fine_tune_split.hide()
+            self.edit_fine_tune_split.hide()
 
     def update_upn_mode_ui(self):
         """Update UPN mode combobox to reflect current backend state"""
@@ -1244,6 +1296,11 @@ class AutoLabelingWidget(QWidget):
             "button_toggle_band",
             "button_detect_plates",
             "button_draw_background",
+            "button_fine_tune",
+            "input_fine_tune_epochs",
+            "edit_fine_tune_epochs",
+            "input_fine_tune_split",
+            "edit_fine_tune_split",
         ]
         for widget in widgets:
             getattr(self, widget).hide()
@@ -2177,3 +2234,7 @@ class AutoLabelingWidget(QWidget):
     def _on_draw_background(self):
         """根据当前标注为每条plate绘制背景条带"""
         self.parent._recompute_background_strips()
+
+    def _on_fine_tune(self):
+        """使用目录中所有已检查图片微调Mask2Former模型"""
+        self.parent._fine_tune_model()

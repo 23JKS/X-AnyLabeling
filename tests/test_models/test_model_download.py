@@ -1,5 +1,7 @@
 import ssl
 
+import pytest
+
 from anylabeling.services.auto_labeling import model as auto_model
 from anylabeling.services.auto_labeling.model import Model
 
@@ -46,3 +48,45 @@ def test_download_with_retry_keeps_tls_certificate_verification(
     )
     assert dest_path.read_bytes() == b"secure"
     assert captured_contexts
+
+
+def test_get_model_abs_path_raises_exception_instance(monkeypatch, tmp_path):
+    monkeypatch.setattr(auto_model, "get_config", lambda: {})
+
+    model = DummyModel({}, lambda _: None)
+    config = {"config_file": str(tmp_path / "cfg.yaml"), "weights": "missing.onnx"}
+
+    with pytest.raises(ValueError, match="Model path not found"):
+        model.get_model_abs_path(config, "weights")
+
+
+def test_get_model_abs_path_resolves_dist_bundle_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(auto_model, "get_config", lambda: {})
+    monkeypatch.setattr(auto_model.sys, "_MEIPASS", "", raising=False)
+
+    bundle_dir = tmp_path / "dist"
+    bundle_file = (
+        bundle_dir
+        / "anylabeling"
+        / "services"
+        / "auto_labeling"
+        / "models"
+        / "plate_yolo"
+        / "best.pt"
+    )
+    bundle_file.parent.mkdir(parents=True)
+    bundle_file.write_bytes(b"plate-model")
+    monkeypatch.setattr(
+        auto_model.sys,
+        "executable",
+        str(bundle_dir / "X-AnyLabeling.exe"),
+        raising=False,
+    )
+
+    model = DummyModel({}, lambda _: None)
+    config = {
+        "config_file": str(tmp_path / "cfg.yaml"),
+        "plate_model_path": "anylabeling/services/auto_labeling/models/plate_yolo/best.pt",
+    }
+
+    assert model.get_model_abs_path(config, "plate_model_path") == str(bundle_file)

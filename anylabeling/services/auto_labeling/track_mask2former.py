@@ -20,14 +20,26 @@ import cv2
 import numpy as np
 import torch
 
+from PIL import Image
 from PyQt6 import QtCore
 from PyQt6.QtCore import QCoreApplication
 
 from anylabeling.views.labeling.shape import Shape
 from anylabeling.views.labeling.logger import logger
+from anylabeling.views.labeling.label_file import LabelFile
 from anylabeling.views.labeling.utils.opencv import qt_img_to_rgb_cv_img
 from .model import Model
 from .types import AutoLabelingResult
+
+try:
+    import tifffile
+    HAS_TIFFFILE = True
+except ImportError:
+    HAS_TIFFFILE = False
+
+
+class FineTuneCancelledError(Exception):
+    """Raised when fine-tuning is cancelled by the user."""
 
 
 # ======================================================================
@@ -709,7 +721,7 @@ def _imread_unicode(path: str) -> np.ndarray:
     return cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
 
 
-def _segment_plate(crop, model, device, conf=0.5):
+def _segment_plate(crop, model, device, model_abs_path, conf=0.5):
     """Run Mask2Former on a plate crop, return instances in crop-local coords."""
     import albumentations as A
     from albumentations.pytorch import ToTensorV2
@@ -728,8 +740,13 @@ def _segment_plate(crop, model, device, conf=0.5):
         outputs = model(pixel_values=inp)
 
     from transformers import Mask2FormerImageProcessor
+    # Load the processor from the local checkpoint directory (which ships with
+    # preprocessor_config.json) instead of the online HuggingFace repo. The
+    # online repo requires a local HF cache that does not exist on a fresh
+    # machine; with local_files_only=True that raises and every plate is
+    # skipped, producing an empty annotation file.
     processor = Mask2FormerImageProcessor.from_pretrained(
-        "facebook/mask2former-swin-tiny-coco-instance",
+        str(model_abs_path),
         size={"height": H_crop, "width": W_crop},
         ignore_index=0,
         local_files_only=True,
@@ -771,6 +788,57 @@ def _segment_plate(crop, model, device, conf=0.5):
     return instances
 
 
+def _load_tiff_log_compressed(image_path):
+    """Load an image for training, applying log-compression to TIFF files.
+
+    This produces the *same* single-channel uint8 pixels the model sees during
+    inference (and the same pixels shown on the canvas for TIFF previews).
+    The original TIFF file is never modified — the log-compressed image exists
+    only in memory.
+
+    Args:
+        image_path: str absolute path to the image file.
+
+    Returns:
+        uint8 grayscale numpy array (H, W), or None on failure.
+    """
+    ext = os.path.splitext(image_path)[1].lower()
+    if ext in (".tif", ".tiff"):
+        try:
+            if HAS_TIFFFILE:
+                img = tifffile.imread(image_path).astype(np.float32)
+            else:
+                img = np.array(Image.open(image_path)).astype(np.float32)
+            if img.ndim == 3:
+                img = img[0]
+            log_img = np.log1p(img)
+            finite = np.isfinite(log_img)
+            if finite.any():
+                vmin, vmax = np.percentile(log_img[finite], [1, 99.9])
+            else:
+                vmin, vmax = 0.0, 1.0
+            if vmax > vmin:
+                img = np.clip(
+                    (log_img - vmin) / (vmax - vmin) * 255, 0, 255
+                ).astype(np.uint8)
+                img[~finite] = 0
+            else:
+                img = np.zeros(log_img.shape, dtype=np.uint8)
+            return img
+        except Exception as e:  # noqa
+            logger.warning(f"Failed to load TIFF {image_path}: {e}")
+            return None
+
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        try:
+            img = np.array(Image.open(image_path).convert("L"))
+        except Exception as e:  # noqa
+            logger.warning(f"Failed to load image {image_path}: {e}")
+            return None
+    return img
+
+
 # ======================================================================
 #  X-AnyLabeling model class
 # ======================================================================
@@ -791,6 +859,11 @@ class TrackMask2Former(Model):
             "button_toggle_band",
             "button_detect_plates",
             "button_draw_background",
+            "button_fine_tune",
+            "input_fine_tune_epochs",
+            "edit_fine_tune_epochs",
+            "input_fine_tune_split",
+            "edit_fine_tune_split",
         ]
         output_modes = {
             "polygon": QCoreApplication.translate("Model", "Polygon"),
@@ -810,7 +883,9 @@ class TrackMask2Former(Model):
 
         self.plate_model_path = self.config.get("plate_model_path", "")
         if self.plate_model_path:
-            self.plate_model_path = os.path.abspath(self.plate_model_path)
+            self.plate_model_path = self.get_model_abs_path(
+                self.config, "plate_model_path"
+            )
         if not self.plate_model_path or not os.path.isfile(self.plate_model_path):
             raise FileNotFoundError(
                 QCoreApplication.translate(
@@ -953,7 +1028,10 @@ class TrackMask2Former(Model):
             ex, ey, ew, eh = expand_box_to_multiple((px, py, pw, ph), (H, W), multiple=32)
             crop = image_gray[ey:ey + eh, ex:ex + ew]
             try:
-                instances = _segment_plate(crop, self.model, self.device, conf=self.conf_threshold)
+                instances = _segment_plate(
+                    crop, self.model, self.device, self.model_abs_path,
+                    conf=self.conf_threshold,
+                )
             except Exception as e:
                 logger.warning(f"Segmentation error for plate ({px},{py}): {e}")
                 continue
@@ -1095,6 +1173,435 @@ class TrackMask2Former(Model):
 
         self.on_message(f"Done: {len(shapes)} shapes ({track_id} tracks, {source_id} sources)")
         return AutoLabelingResult(shapes, replace=self.replace)
+
+    # ------------------------------------------------------------------
+    #  Fine-tuning (uses all "checked" images in the current directory)
+    # ------------------------------------------------------------------
+
+    def _build_training_sample(self, image_path, label_path):
+        """Reconstruct a training sample from an image + its label file.
+
+        Returns (img_uint8, masks, class_ids) or None if the sample is empty
+        or unreadable. The image is log-compressed *in memory* (original TIFF
+        is left untouched). Masks are rebuilt from stored annotations:
+        track linestrips -> ribbon mask (centerline + width), source polygons
+        -> filled polygon mask.
+        """
+        import re
+
+        img = _load_tiff_log_compressed(image_path)
+        if img is None or img.size == 0:
+            return None
+        H, W = img.shape[:2]
+
+        try:
+            lf = LabelFile(label_path)
+        except Exception as e:  # noqa
+            logger.warning(f"Failed to load label file {label_path}: {e}")
+            return None
+
+        masks = []
+        class_ids = []
+        for shape in lf.shapes:
+            label = shape.label or ""
+            if re.match(r"^track(_\d+)?$", label):
+                cls_id = 0
+                od = shape.other_data or {}
+                centerline = od.get("centerline")
+                track_width = int(od.get("track_width", self._default_track_width))
+                if centerline and len(centerline) >= 2:
+                    mask = centerline_to_ribbon_mask(
+                        centerline, track_width, H, W
+                    )
+                else:
+                    mask = np.zeros((H, W), dtype=np.uint8)
+                    pts = np.array(
+                        [[int(p.x()), int(p.y())] for p in shape.points],
+                        dtype=np.int32,
+                    )
+                    if len(pts) >= 2:
+                        cv2.polylines(
+                            mask, [pts], isClosed=False, color=1,
+                            thickness=max(1, track_width),
+                        )
+            elif re.match(r"^source(_\d+)?$", label):
+                cls_id = 1
+                mask = np.zeros((H, W), dtype=np.uint8)
+                pts = np.array(
+                    [[int(p.x()), int(p.y())] for p in shape.points],
+                    dtype=np.int32,
+                )
+                if len(pts) >= 3:
+                    cv2.fillPoly(mask, [pts], 1)
+            else:
+                continue
+
+            if mask is None or int(mask.sum()) < 4:
+                continue
+            masks.append(mask.astype(np.float32))
+            class_ids.append(cls_id)
+
+        if not masks:
+            return None
+        return img, masks, class_ids
+
+    def _pad_training_sample(self, img_u8, masks):
+        """Pad an image and its masks to multiples of 32 without resizing.
+
+        The Swin backbone requires both dimensions to be divisible by 32, but
+        the reference training loop never resizes plate crops (they are
+        already 32× multiples). To keep native resolution and aspect ratio
+        here, we only pad the right/bottom edges with the background value
+        (0), which becomes -1.0 after Normalize(0.5, 0.5) — matching the
+        reference collate_fn's -1.0 pixel padding.
+        """
+        H, W = img_u8.shape[:2]
+        pad_h = (-H) % 32
+        pad_w = (-W) % 32
+        img_padded = np.pad(
+            img_u8, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0
+        )
+        masks_padded = []
+        for mask in masks:
+            m = np.pad(
+                mask, ((0, pad_h), (0, pad_w)), mode="constant", constant_values=0
+            )
+            masks_padded.append(m.astype(np.float32))
+        return img_padded, masks_padded
+
+    def fine_tune_on_checked_images(
+        self,
+        data_items,
+        epochs=None,
+        lr=None,
+        train_ratio=None,
+        progress_cb=None,
+        cancel_event=None,
+    ):
+        """Fine-tune the Mask2Former model using checked images.
+
+        Runs synchronously (call it from a worker thread to keep the UI
+        responsive). Progress is reported via ``self.on_message`` (status
+        text) and ``progress_cb(percent, message)`` (UI progress bar).
+
+        Images are used at their native resolution (only padded to multiples
+        of 32 for the Swin backbone) — matching the reference training loop,
+        which never resizes plate crops.
+
+        Args:
+            data_items: list of (image_path, label_path) tuples.
+            epochs: number of training epochs (default from config, else 3).
+            lr: learning rate (default from config, else 5e-5).
+            train_ratio: fraction of samples used for training (0-1); the
+                remaining samples form the validation set.
+            progress_cb: optional callable(percent:int, message:str) invoked
+                as training progresses.
+            cancel_event: optional threading.Event; when set, training is
+                aborted and FineTuneCancelledError is raised.
+
+        Returns:
+            (num_samples, saved_path) tuple.
+        """
+        import albumentations as A
+        from albumentations.pytorch import ToTensorV2
+
+        import random
+        import shutil
+        from safetensors.torch import save_file
+
+        if self.model is None:
+            raise RuntimeError(
+                QCoreApplication.translate(
+                    "Model", "Model is not loaded."
+                )
+            )
+
+        epochs = int(epochs or self.config.get("fine_tune_epochs", 3))
+        lr = float(lr if lr is not None else self.config.get("fine_tune_lr", 5e-5))
+        train_ratio = float(
+            train_ratio
+            if train_ratio is not None
+            else self.config.get("fine_tune_train_ratio", 0.8)
+        )
+        train_ratio = min(max(train_ratio, 0.0), 1.0)
+
+        def _check_cancel():
+            if cancel_event is not None and cancel_event.is_set():
+                raise FineTuneCancelledError(
+                    QCoreApplication.translate(
+                        "Model", "Fine-tuning cancelled by user."
+                    )
+                )
+
+        def _report(percent, message):
+            if progress_cb is not None:
+                try:
+                    progress_cb(int(percent), str(message))
+                except Exception:  # noqa
+                    pass
+
+        # 1. Prepare training samples (log-compressed, in memory).
+        _check_cancel()
+        _report(
+            0,
+            QCoreApplication.translate("Model", "Preparing fine-tune data..."),
+        )
+        samples = []
+        total_files = max(1, len(data_items))
+        for i, (image_path, label_path) in enumerate(data_items):
+            _check_cancel()
+            sample = self._build_training_sample(image_path, label_path)
+            if sample is not None:
+                samples.append(sample)
+            _report(
+                int(10 * (i + 1) / total_files),
+                QCoreApplication.translate(
+                    "Model", "Preparing sample {i}/{n}..."
+                ).format(i=i + 1, n=len(data_items)),
+            )
+
+        if not samples:
+            raise RuntimeError(
+                QCoreApplication.translate(
+                    "Model",
+                    "No valid checked samples found to fine-tune.",
+                )
+            )
+
+        # 2. Train/validation split.
+        random.shuffle(samples)
+        n_train = max(1, int(round(len(samples) * train_ratio)))
+        if len(samples) > 1:
+            n_train = max(1, min(n_train, len(samples) - 1))
+        train_samples = samples[:n_train]
+        val_samples = samples[n_train:]
+
+        self.on_message(
+            QCoreApplication.translate(
+                "Model",
+                "Collected {count} sample(s): {t} train / {v} val. "
+                "Starting fine-tune...",
+            ).format(
+                count=len(samples),
+                t=len(train_samples),
+                v=len(val_samples),
+            )
+        )
+        _report(
+            10,
+            QCoreApplication.translate("Model", "Starting training..."),
+        )
+
+        device = self.device
+        model = self.model
+        model.to(device)
+        model.train()
+
+        weight_decay = float(
+            self.config.get("fine_tune_weight_decay", 1e-4)
+        )
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, epochs)
+        )
+
+        transform = A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.Normalize(mean=(0.5,), std=(0.5,), max_pixel_value=255.0),
+            ToTensorV2(),
+        ])
+        val_transform = A.Compose([
+            A.Normalize(mean=(0.5,), std=(0.5,), max_pixel_value=255.0),
+            ToTensorV2(),
+        ])
+
+        def _forward_loss(img_u8, masks, class_ids, transform=transform):
+            img_padded, masks_padded = self._pad_training_sample(
+                img_u8, masks
+            )
+            transformed = transform(image=img_padded, masks=masks_padded)
+            inp = transformed["image"].float().unsqueeze(0).to(device)
+            mask_tensor = torch.stack(
+                [m.float() for m in transformed["masks"]]
+            ).to(device)
+            class_tensor = torch.as_tensor(
+                class_ids, dtype=torch.long, device=device
+            )
+            return model(
+                pixel_values=inp,
+                mask_labels=[mask_tensor],
+                class_labels=[class_tensor],
+            ).loss
+
+        # Save paths + helper (one-time backup of the original weights).
+        out_dir = Path(self.model_abs_path)
+        save_path = out_dir / "model.safetensors"
+        backup_path = out_dir / "model.safetensors.orig"
+
+        def _save_model(state_dict):
+            if save_path.is_file() and not backup_path.is_file():
+                shutil.copy2(str(save_path), str(backup_path))
+            save_file(state_dict, str(save_path))
+
+        # Baseline validation loss of the ORIGINAL model (before training).
+        # The fine-tuned model is only saved when it beats this baseline.
+        baseline_val_loss = None
+        if val_samples:
+            _check_cancel()
+            model.eval()
+            base_loss = 0.0
+            bn = 0
+            with torch.no_grad():
+                for img_u8, masks, class_ids in val_samples:
+                    _check_cancel()
+                    bl = _forward_loss(
+                        img_u8, masks, class_ids, transform=val_transform
+                    )
+                    if bl is not None:
+                        base_loss += float(bl.item())
+                        bn += 1
+            model.train()
+            if bn:
+                baseline_val_loss = base_loss / bn
+            self.on_message(
+                QCoreApplication.translate(
+                    "Model", "Baseline val_loss={loss:.4f}"
+                ).format(
+                    loss=baseline_val_loss if baseline_val_loss is not None else 0.0
+                )
+            )
+
+        best_val_loss = baseline_val_loss
+        best_state_dict = None
+        saved = False
+
+        total_steps = max(1, epochs * len(train_samples))
+        step = 0
+        for epoch in range(epochs):
+            _check_cancel()
+            model.train()
+            epoch_loss = 0.0
+            n = 0
+            order = list(range(len(train_samples)))
+            random.shuffle(order)
+            for idx in order:
+                _check_cancel()
+                img_u8, masks, class_ids = train_samples[idx]
+                loss = _forward_loss(img_u8, masks, class_ids)
+                if loss is None:
+                    continue
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
+                optimizer.step()
+
+                epoch_loss += float(loss.item())
+                n += 1
+                step += 1
+                _report(
+                    10 + int(80 * step / total_steps),
+                    QCoreApplication.translate(
+                        "Model", "Epoch {e}/{E} ({s}/{S}) loss={loss:.4f}"
+                    ).format(
+                        e=epoch + 1,
+                        E=epochs,
+                        s=step,
+                        S=total_steps,
+                        loss=float(loss.item()),
+                    ),
+                )
+
+            scheduler.step()
+            avg = epoch_loss / n if n else 0.0
+
+            # Validation on the held-out split.
+            val_msg = ""
+            epoch_val = None
+            if val_samples:
+                _check_cancel()
+                model.eval()
+                val_loss = 0.0
+                vn = 0
+                with torch.no_grad():
+                    for img_u8, masks, class_ids in val_samples:
+                        _check_cancel()
+                        vloss = _forward_loss(
+                            img_u8, masks, class_ids, transform=val_transform
+                        )
+                        if vloss is not None:
+                            val_loss += float(vloss.item())
+                            vn += 1
+                model.train()
+                if vn:
+                    epoch_val = val_loss / vn
+                val_msg = QCoreApplication.translate(
+                    "Model", " val_loss={loss:.4f}"
+                ).format(loss=epoch_val if epoch_val is not None else 0.0)
+
+                # Save only when this epoch beats the original model's loss.
+                if epoch_val is not None and (
+                    best_val_loss is None or epoch_val < best_val_loss
+                ):
+                    best_val_loss = epoch_val
+                    best_state_dict = {
+                        k: v.detach().cpu().clone()
+                        for k, v in model.state_dict().items()
+                    }
+                    _check_cancel()
+                    _save_model(best_state_dict)
+                    saved = True
+                    val_msg += QCoreApplication.translate(
+                        "Model", " (saved)"
+                    )
+
+            self.on_message(
+                QCoreApplication.translate(
+                    "Model", "Epoch {epoch}/{total} loss={loss:.4f}"
+                ).format(epoch=epoch + 1, total=epochs, loss=avg)
+                + val_msg
+            )
+
+        model.eval()
+
+        # 3. Restore the best weights (if any) and finalize.
+        _check_cancel()
+        if best_state_dict is not None:
+            _report(
+                92,
+                QCoreApplication.translate("Model", "Restoring best model..."),
+            )
+            model.load_state_dict(best_state_dict)
+
+        _report(
+            100,
+            QCoreApplication.translate("Model", "Fine-tuning complete."),
+        )
+
+        if saved:
+            self.on_message(
+                QCoreApplication.translate(
+                    "Model", "Fine-tune done. Saved best model to {path}"
+                ).format(path=str(save_path))
+            )
+            return len(samples), str(save_path)
+
+        self.on_message(
+            QCoreApplication.translate(
+                "Model",
+                "Fine-tuning finished but no epoch improved over the "
+                "original model (baseline val_loss={base:.4f}). Model "
+                "left unchanged.",
+            ).format(
+                base=baseline_val_loss if baseline_val_loss is not None else 0.0
+            )
+        )
+        return len(samples), None
 
     def unload(self):
         global _YOLO_MODEL, _YOLO_MODEL_PATH

@@ -245,17 +245,16 @@ def _polygon_is_simple(polygon):
     return True
 
 
-def load_image_as_uint8(image_path):
+def load_image_array(image_path):
     data = np.fromfile(image_path, dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
     if img is None:
-        img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            raise ValueError(f"Cannot load image: {image_path}")
-    if img.dtype != np.uint8:
-        log_img = np.log1p(img.astype(np.float32))
-        vmin, vmax = np.percentile(log_img, [1, 99.9])
-        img = np.clip((log_img - vmin) / (vmax - vmin) * 255, 0, 255).astype(np.uint8)
+        raise ValueError(f"Cannot load image: {image_path}")
+    if img.ndim == 3:
+        if img.shape[2] == 1:
+            img = img[:, :, 0]
+        else:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return img
 
 
@@ -282,7 +281,7 @@ def compute_spectra(image_path, shapes, output_dir, scale=1.0, smooth=3,
             progress_callback("matplotlib 未安装，无法生成能谱图")
         return None
 
-    img = load_image_as_uint8(image_path)
+    img = load_image_array(image_path)
     H, W = img.shape
     plates = group_by_plate(shapes)
 

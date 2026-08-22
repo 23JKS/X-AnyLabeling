@@ -70,6 +70,27 @@ class AppLogger:
         stream_handler.setFormatter(handler_format)
         self.logger.addHandler(stream_handler)
 
+        # Also write to a log file so errors are visible even when the app is
+        # frozen with console=False (stderr is discarded in windowed builds).
+        try:
+            import os
+
+            log_dir = os.path.join(os.path.expanduser("~"), ".xanylabeling")
+            os.makedirs(log_dir, exist_ok=True)
+            file_handler = logging.FileHandler(
+                os.path.join(log_dir, "xanylabeling.log"),
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s | %(levelname)s | %(module)s:%(funcName)s:%(lineno)d - %(message)s"
+                )
+            )
+            self.logger.addHandler(file_handler)
+        except OSError:
+            # Never let logging setup break the app.
+            pass
+
     def __getattr__(self, name: str) -> Callable:
         return getattr(self.logger, name)
 

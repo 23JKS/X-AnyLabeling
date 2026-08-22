@@ -1,6 +1,8 @@
 import unittest
+import io
 from unittest import mock
 
+import numpy as np
 from PIL import Image
 from PyQt6 import QtGui
 
@@ -50,3 +52,22 @@ class TestImageUtils(unittest.TestCase):
 
         self.assertTrue(image.isNull())
         mocked_img_data_to_pil.assert_not_called()
+
+    def test_img_data_to_qimage_normalizes_tiff_before_display(self):
+        pixels = np.ones((10, 10), dtype=np.uint16) * 100
+        pixels[0, 0] = 10000
+        pixels[5, 5] = 5000
+        pixels[5, 6] = 5000
+        pixels[5, 7] = 5000
+        source = Image.fromarray(pixels)
+        buffer = io.BytesIO()
+        source.save(buffer, format="TIFF")
+
+        image = img_data_to_qimage(buffer.getvalue(), "sample.tif")
+
+        self.assertFalse(image.isNull())
+        self.assertEqual(image.format(), QtGui.QImage.Format.Format_Grayscale8)
+        self.assertGreater(image.pixelColor(5, 5).red(), 200)
+        self.assertEqual(image.pixelColor(5, 5).red(), image.pixelColor(5, 5).green())
+        self.assertEqual(image.pixelColor(5, 5).red(), image.pixelColor(5, 5).blue())
+        self.assertEqual(image.pixelColor(1, 1).red(), 0)

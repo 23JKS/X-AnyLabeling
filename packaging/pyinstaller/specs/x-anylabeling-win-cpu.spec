@@ -151,13 +151,13 @@ a = Analysis(
     pathex=[_p('anylabeling')],
     binaries=onnxruntime_binaries,
     datas=[
-        (_p('anylabeling', 'configs', 'auto_labeling', '*.yaml'), 'anylabeling/configs/auto_labeling'),
-        (_p('anylabeling', 'configs', '*.yaml'), 'anylabeling/configs'),
-        (_p('anylabeling', 'views', 'labeling', 'widgets', 'auto_labeling', 'auto_labeling.ui'), 'anylabeling/views/labeling/widgets/auto_labeling'),
-        (_p('anylabeling', 'services', 'auto_labeling', 'configs', 'bert', '*'), 'anylabeling/services/auto_labeling/configs/bert'),
-        (_p('anylabeling', 'services', 'auto_labeling', 'configs', 'clip', '*'), 'anylabeling/services/auto_labeling/configs/clip'),
-        (_p('anylabeling', 'services', 'auto_labeling', 'configs', 'ppocr', '*'), 'anylabeling/services/auto_labeling/configs/ppocr'),
-        (_p('anylabeling', 'services', 'auto_labeling', 'configs', 'ram', '*'), 'anylabeling/services/auto_labeling/configs/ram')
+        (_p('anylabeling', 'configs', '*'), 'anylabeling/configs'),
+        (_p('anylabeling', 'resources', '*'), 'anylabeling/resources'),
+        (_p('anylabeling', 'views', '*'), 'anylabeling/views'),
+        (_p('anylabeling', 'services', '*'), 'anylabeling/services'),
+        (_p('anylabeling', 'services', 'auto_labeling', 'models'), 'anylabeling/services/auto_labeling/models'),
+        (_p('assets', '*'), 'assets'),
+        (_p('anylabeling', 'views', 'labeling', 'widgets', 'auto_labeling', 'auto_labeling.ui'), 'anylabeling/views/labeling/widgets/auto_labeling')
     ] + matplotlib_datas,
     hiddenimports=[
         'matplotlib',
@@ -173,12 +173,18 @@ a.binaries = _strip_msvc_runtime_binaries(a.binaries)
 if msvc_runtime_binaries:
     a.binaries += _to_binary_toc_entries(msvc_runtime_binaries)
 pyz = PYZ(a.pure, a.zipped_data)
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+
+# onedir (folder) vs onefile (single .exe) build:
+#   - onedir (default) unpacks everything into a folder next to the exe at
+#     build time, so there is no runtime unpacking and the
+#     "failed to extract entry: LIBBZ2.dll" error cannot occur. It also
+#     starts faster. This is the recommended mode for distribution.
+#   - onefile embeds everything in one .exe and unpacks it to %TEMP% on every
+#     launch; that runtime unpacking is exactly where the error above occurs.
+#     Set X_ANYLABELING_ONEFILE=1 to build a single .exe instead.
+build_onefile = os.environ.get('X_ANYLABELING_ONEFILE', '0') == '1'
+
+exe_kwargs = dict(
     name=f'X-AnyLabeling-v{__version__}-CPU',
     debug=False,
     strip=False,
@@ -187,6 +193,34 @@ exe = EXE(
     console=False,
     icon=_p('anylabeling', 'resources', 'images', 'icon.icns'),
 )
+
+if build_onefile:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        **exe_kwargs,
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        **exe_kwargs,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        name='X-AnyLabeling-CPU',
+        strip=False,
+        upx=False,
+    )
+
 app = BUNDLE(
     exe,
     name='X-AnyLabeling.app',

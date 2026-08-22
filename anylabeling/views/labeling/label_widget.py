@@ -6,6 +6,8 @@ import os
 import os.path as osp
 import re
 import shutil
+import sys
+import threading
 from typing import Optional
 
 import cv2
@@ -97,6 +99,36 @@ from .widgets import (
     NavigatorDialog,
 )
 
+
+def _resolve_runtime_model_path(model_path, config_path=None):
+    """Resolve a bundled or source-tree model path."""
+    if not model_path:
+        return ""
+    if os.path.isabs(model_path):
+        return os.path.normpath(model_path)
+
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bundle_root = osp.abspath(meipass)
+        candidates.extend(
+            [
+                osp.join(bundle_root, model_path),
+                osp.join(bundle_root, "anylabeling", model_path),
+                osp.join(bundle_root, "resources", model_path),
+            ]
+        )
+
+    if config_path:
+        candidates.append(osp.join(osp.dirname(config_path), model_path))
+    candidates.append(osp.abspath(model_path))
+
+    for candidate in candidates:
+        candidate = osp.normpath(candidate)
+        if osp.isfile(candidate):
+            return candidate
+    return osp.normpath(candidates[0] if candidates else model_path)
+
 LABEL_COLORMAP = utils.label_colormap()
 LABEL_OPACITY = 128
 CHECKED_FIELD = "checked"
@@ -128,6 +160,12 @@ def _create_file_status_icon(color):
     painter.drawEllipse(2, 2, 8, 8)
     painter.end()
     return QtGui.QIcon(pixmap)
+
+
+class _FineTuneSignals(QtCore.QObject):
+    """Signals emitted from the fine-tune worker thread to the UI thread."""
+
+    progress = QtCore.pyqtSignal(int, str)
 
 
 class LabelingWidget(LabelDialog):
@@ -6331,6 +6369,275 @@ class LabelingWidget(LabelDialog):
         self.canvas.update()
         self.label_list.update()
 
+    def _fine_tune_model(self):
+        """Fine-tune the Mask2Former model using all checked images in the
+        current directory. Images are log-compressed in memory (original TIFF
+        files are never modified)."""
+        aw = self.auto_labeling_widget
+        model_config = aw.model_manager.loaded_model_config
+        model = model_config.get("model") if model_config else None
+        if model is None or not hasattr(model, "fine_tune_on_checked_images"):
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.tr("Fine-tune Model"),
+                self.tr("The current model does not support fine-tuning."),
+            )
+            return
+
+        # Determine the image directory and list of images.
+        if self.image_list:
+            dir_path = osp.dirname(self.image_list[0])
+            image_files = list(self.image_list)
+        elif self.filename:
+            dir_path = osp.dirname(self.filename)
+            image_files = [self.filename]
+        else:
+            QtWidgets.QMessageBox.warning(
+                self,
+                self.tr("Fine-tune Model"),
+                self.tr("No image directory is open."),
+            )
+            return
+
+        label_dir = self.output_dir or dir_path
+        data_items = []
+        for image_file in image_files:
+            base = osp.splitext(osp.basename(image_file))[0]
+            label_file = osp.join(label_dir, base + ".json")
+            if not osp.exists(label_file):
+                continue
+            try:
+                lf = LabelFile(label_file)
+            except Exception:
+                continue
+            if lf.other_data.get("checked", False) is not True:
+                continue
+            data_items.append((image_file, label_file))
+
+        if not data_items:
+            QtWidgets.QMessageBox.information(
+                self,
+                self.tr("Fine-tune Model"),
+                self.tr(
+                    "No checked images found in the current directory.\n"
+                    "Mark images as checked (Ctrl+Alt+K) before fine-tuning."
+                ),
+            )
+            return
+
+        ret = QtWidgets.QMessageBox.question(
+            self,
+            self.tr("Fine-tune Model"),
+            self.tr(
+                "This will fine-tune the Mask2Former model using {count} "
+                "checked image(s).\nImages are log-compressed in memory and "
+                "the original files are not modified.\n\nTraining may take a "
+                "while. Continue?"
+            ).format(count=len(data_items)),
+        )
+        if ret != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+
+        # Read fine-tune hyper-parameters from the UI (if present).
+        epochs_widget = getattr(aw, "edit_fine_tune_epochs", None)
+        epochs = epochs_widget.value() if epochs_widget is not None else 3
+        split_widget = getattr(aw, "edit_fine_tune_split", None)
+        train_ratio = (
+            split_widget.value() / 100.0 if split_widget is not None else 0.8
+        )
+
+        # Disable the button during training.
+        self._fine_tune_button = getattr(aw, "button_fine_tune", None)
+        if self._fine_tune_button is not None:
+            self._fine_tune_button.setEnabled(False)
+
+        self._fine_tune_result = None
+        self._fine_tune_cancel_event = threading.Event()
+
+        # Progress dialog with a Cancel button.
+        self._fine_tune_progress = QtWidgets.QProgressDialog(
+            self.tr("Preparing fine-tune data..."),
+            self.tr("Cancel"),
+            0,
+            100,
+            self,
+        )
+        self._fine_tune_progress.setWindowTitle(self.tr("Fine-tune Model"))
+        self._fine_tune_progress.setWindowModality(
+            QtCore.Qt.WindowModality.WindowModal
+        )
+        self._fine_tune_progress.setMinimumDuration(0)
+        self._fine_tune_progress.setAutoClose(False)
+        self._fine_tune_progress.setAutoReset(False)
+        self._fine_tune_progress.setValue(0)
+        self._fine_tune_progress.canceled.connect(self._on_fine_tune_cancel)
+        self._fine_tune_progress.show()
+
+        # Bridge progress from the worker thread to the UI thread.
+        self._fine_tune_signals = _FineTuneSignals()
+        self._fine_tune_signals.progress.connect(self._on_fine_tune_progress)
+
+        self._fine_tune_thread = QtCore.QThread(self)
+        from anylabeling.utils import GenericWorker
+
+        self._fine_tune_worker = GenericWorker(
+            self._run_fine_tune,
+            model,
+            data_items,
+            epochs,
+            train_ratio,
+            self._fine_tune_cancel_event,
+        )
+        self._fine_tune_worker.moveToThread(self._fine_tune_thread)
+        self._fine_tune_thread.started.connect(self._fine_tune_worker.run)
+        self._fine_tune_worker.finished.connect(self._fine_tune_thread.quit)
+        self._fine_tune_worker.finished.connect(self._on_fine_tune_finished)
+        self._fine_tune_thread.finished.connect(
+            self._fine_tune_thread.deleteLater
+        )
+
+        # Show visible feedback during training (loading overlay + status bar
+        # progress). The model's on_message is routed to new_model_status, so
+        # connect it to the status bar as well for per-epoch progress.
+        self.canvas.set_loading(True, self.tr("Fine-tuning model..."))
+        self.statusBar().showMessage(
+            self.tr("Preparing fine-tune data ({count} image(s))...").format(
+                count=len(data_items)
+            )
+        )
+        self._fine_tune_status_conn = aw.model_manager.new_model_status.connect(
+            lambda msg: self.statusBar().showMessage(msg)
+        )
+
+        self._fine_tune_thread.start()
+
+    def _run_fine_tune(
+        self, model, data_items, epochs, train_ratio, cancel_event
+    ):
+        """Worker thread body. Stores (ok, payload) in _fine_tune_result."""
+        from anylabeling.services.auto_labeling.track_mask2former import (
+            FineTuneCancelledError,
+        )
+
+        def progress_cb(percent, message):
+            self._fine_tune_signals.progress.emit(int(percent), str(message))
+
+        try:
+            result = model.fine_tune_on_checked_images(
+                data_items,
+                epochs=epochs,
+                train_ratio=train_ratio,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+            )
+            self._fine_tune_result = (True, result)
+        except FineTuneCancelledError:
+            self._fine_tune_result = ("cancelled", None)
+        except Exception as e:  # noqa
+            logger.exception("Fine-tune failed: %s", e)
+            self._fine_tune_result = (False, str(e))
+
+    @pyqtSlot(int, str)
+    def _on_fine_tune_progress(self, percent, message):
+        """Update the progress dialog and status bar from the worker thread."""
+        progress = getattr(self, "_fine_tune_progress", None)
+        if progress is not None:
+            progress.setValue(percent)
+            progress.setLabelText(message)
+        self.statusBar().showMessage(message)
+
+    def _on_fine_tune_cancel(self):
+        """Request cancellation of the running fine-tune job."""
+        cancel_event = getattr(self, "_fine_tune_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
+        progress = getattr(self, "_fine_tune_progress", None)
+        if progress is not None:
+            progress.setLabelText(self.tr("Cancelling..."))
+            # Hide the cancel button to prevent repeated clicks.
+            progress.setCancelButton(None)
+        self.statusBar().showMessage(self.tr("Cancelling fine-tune..."))
+
+    @pyqtSlot()
+    def _on_fine_tune_finished(self):
+        """Re-enable the button, clear feedback, and report the result."""
+        self.canvas.set_loading(False)
+
+        # Close the progress dialog.
+        progress = getattr(self, "_fine_tune_progress", None)
+        if progress is not None:
+            try:
+                progress.close()
+            except RuntimeError:
+                pass
+            self._fine_tune_progress = None
+
+        # Disconnect the temporary status-bar progress link.
+        conn = getattr(self, "_fine_tune_status_conn", None)
+        if conn is not None:
+            try:
+                self.auto_labeling_widget.model_manager.new_model_status.disconnect(
+                    conn
+                )
+            except (TypeError, RuntimeError):
+                pass
+            self._fine_tune_status_conn = None
+
+        if getattr(self, "_fine_tune_button", None) is not None:
+            self._fine_tune_button.setEnabled(True)
+            self._fine_tune_button = None
+
+        result = getattr(self, "_fine_tune_result", None)
+        if result is None:
+            self.statusBar().showMessage(self.tr("Fine-tuning finished."))
+            return
+        ok, payload = result
+        if ok == "cancelled":
+            self.statusBar().showMessage(self.tr("Fine-tuning cancelled."))
+            QtWidgets.QMessageBox.information(
+                self,
+                self.tr("Fine-tune Model"),
+                self.tr(
+                    "Fine-tuning was cancelled. The model was not modified."
+                ),
+            )
+            return
+        if ok:
+            n, path = payload
+            if path is None:
+                self.statusBar().showMessage(
+                    self.tr("Fine-tuning finished (no improvement).")
+                )
+                QtWidgets.QMessageBox.information(
+                    self,
+                    self.tr("Fine-tune Model"),
+                    self.tr(
+                        "Fine-tuning finished using {count} sample(s), but "
+                        "no epoch improved over the original model. The "
+                        "model was left unchanged."
+                    ).format(count=n),
+                )
+            else:
+                self.statusBar().showMessage(
+                    self.tr("Fine-tuning finished ({count} sample(s)).").format(
+                        count=n
+                    )
+                )
+                QtWidgets.QMessageBox.information(
+                    self,
+                    self.tr("Fine-tune Model"),
+                    self.tr(
+                        "Fine-tune completed using {count} sample(s).\n\nSaved to:\n{path}"
+                    ).format(count=n, path=path),
+                )
+        else:
+            self.statusBar().showMessage(self.tr("Fine-tuning failed."))
+            QtWidgets.QMessageBox.critical(
+                self,
+                self.tr("Fine-tune Model"),
+                self.tr("Fine-tune failed:\n{error}").format(error=payload),
+            )
+
     def _recompute_background_strips(self):
         """Recompute background strip polygons after manual track addition/editing.
 
@@ -6426,9 +6733,9 @@ class LabelingWidget(LabelDialog):
         except Exception:
             plate_model_path = ""
 
-        # Resolve relative path (original behavior depended on CWD = project root)
-        if plate_model_path:
-            plate_model_path = os.path.abspath(plate_model_path)
+        plate_model_path = _resolve_runtime_model_path(
+            plate_model_path, str(config_path)
+        )
 
         if not plate_model_path or not os.path.isfile(plate_model_path):
             QtWidgets.QMessageBox.warning(
@@ -6438,14 +6745,15 @@ class LabelingWidget(LabelDialog):
             )
             return
 
-        # Read current image
+        # Use the already normalized display image so TIFF detection receives
+        # the same single-channel Log-compressed pixels shown in the canvas.
         try:
-            data = np.fromfile(self.image_path, dtype=np.uint8)
-            img_bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-            if img_bgr is None:
-                return
-            H, W = img_bgr.shape[:2]
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            from anylabeling.views.labeling.utils.opencv import (
+                qt_img_to_rgb_cv_img,
+            )
+
+            img_rgb = qt_img_to_rgb_cv_img(self.image)
+            H, W = img_rgb.shape[:2]
         except Exception:
             return
 
@@ -6495,8 +6803,7 @@ class LabelingWidget(LabelDialog):
             x2 = min(W, x + w + pad)
             y2 = min(H, y + h + pad)
 
-            crop = img_bgr[y1:y2, x1:x2]
-            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            crop_rgb = np.ascontiguousarray(img_rgb[y1:y2, x1:x2])
 
             # Gather shapes that belong to this plate
             shapes = []

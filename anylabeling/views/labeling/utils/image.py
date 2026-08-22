@@ -69,8 +69,59 @@ def img_pil_to_data(img_pil):
     return img_data
 
 
+def normalize_image_for_display(img, filename=None):
+    """Create a single-channel TIFF preview using logarithmic compression."""
+    if img is None:
+        return img
+
+    lower_name = (filename or "").lower()
+    is_tiff = lower_name.endswith((".tif", ".tiff"))
+    if not is_tiff:
+        return img
+
+    arr = np.asarray(img)
+    if arr.ndim == 3:
+        arr = np.asarray(img.convert("L"))
+    if arr.ndim != 2:
+        return img
+
+    arr = arr.astype(np.float32, copy=False)
+    arr = np.log1p(arr)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        normalized = np.zeros(arr.shape, dtype=np.uint8)
+    else:
+        display_min = float(arr[finite].min())
+        display_max = float(arr[finite].max())
+        if display_max > display_min:
+            normalized = np.clip(
+                (arr - display_min)
+                / (display_max - display_min)
+                * 255,
+                0,
+                255,
+            ).astype(np.uint8)
+            normalized[~finite] = 0
+        else:
+            normalized = np.zeros(arr.shape, dtype=np.uint8)
+
+    return PIL.Image.fromarray(normalized, mode="L")
+
+
 def pil_to_qimage(img):
     """Convert PIL Image to QImage."""
+    if img.mode == "L":
+        data = np.asarray(img, dtype=np.uint8)
+        height, width = data.shape
+        qimage = QtGui.QImage(
+            data,
+            width,
+            height,
+            width,
+            QtGui.QImage.Format.Format_Grayscale8,
+        )
+        return qimage
+
     img = img.convert("RGBA")  # Ensure image is in RGBA format
     data = np.array(img)
     height, width, channel = data.shape
@@ -86,17 +137,25 @@ def pil_to_qimage(img):
 
 
 def img_data_to_qimage(img_data, filename=None):
-    image = QtGui.QImage.fromData(img_data)
-    if not image.isNull():
-        return image
+    is_tiff = bool(filename) and filename.lower().endswith((".tif", ".tiff"))
+    if not is_tiff:
+        image = QtGui.QImage.fromData(img_data)
+        if not image.isNull():
+            return image
 
-    if not filename or not filename.lower().endswith(EXTRA_IMAGE_EXTENSIONS):
-        return image
+    if not is_tiff and (
+        not filename or not filename.lower().endswith(EXTRA_IMAGE_EXTENSIONS)
+    ):
+        return QtGui.QImage.fromData(img_data)
 
     try:
-        return pil_to_qimage(img_data_to_pil(img_data)).copy()
+        pil_img = img_data_to_pil(img_data)
+        pil_img = normalize_image_for_display(pil_img, filename)
+        return pil_to_qimage(pil_img).copy()
     except Exception:
-        return image
+        if is_tiff:
+            return QtGui.QImage()
+        return QtGui.QImage.fromData(img_data)
 
 
 def img_arr_to_b64(img_arr):

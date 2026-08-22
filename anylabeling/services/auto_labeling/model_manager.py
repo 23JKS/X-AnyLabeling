@@ -1,8 +1,11 @@
 import os
+import sys
 import copy
 import time
+import tempfile
 import yaml
 import importlib.resources as pkg_resources
+from pathlib import Path
 from threading import Lock, Event
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
@@ -30,6 +33,64 @@ from anylabeling.services.auto_labeling import (
     _AUTO_LABELING_PROMPT_MODELS,
     _ON_NEXT_FILES_CHANGED_MODELS,
 )
+
+
+def _resolve_config_path(config_file):
+    """Resolve config file paths for both source and PyInstaller bundles."""
+    if not config_file:
+        return config_file
+
+    if os.path.isabs(config_file) and os.path.exists(config_file):
+        return config_file
+
+    candidates = []
+
+    project_root = Path(__file__).resolve().parents[3]
+    meipass = getattr(sys, "_MEIPASS", None)
+    executable = getattr(sys, "executable", None)
+
+    if meipass:
+        meipass_root = Path(meipass)
+        candidates.extend(
+            [
+                meipass_root / config_file,
+                meipass_root / "anylabeling" / config_file,
+                meipass_root / "resources" / config_file,
+            ]
+        )
+
+    if executable:
+        exe_root = Path(executable).resolve().parent
+        candidates.extend(
+            [
+                exe_root / config_file,
+                exe_root / "anylabeling" / config_file,
+                exe_root.parent / config_file,
+                exe_root.parent / "anylabeling" / config_file,
+            ]
+        )
+
+    candidates.append(project_root / config_file)
+    candidates.append(project_root / "anylabeling" / config_file)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return config_file
+
+
+def _prepare_tiff_model_input(image, filename):
+    """Save the normalized TIFF preview as a temporary PNG input."""
+    if not filename or not filename.lower().endswith((".tif", ".tiff")):
+        return filename, None
+
+    temporary_file = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    temporary_file.close()
+    if not image.save(temporary_file.name, "PNG"):
+        os.unlink(temporary_file.name)
+        raise ValueError("Failed to create normalized TIFF PNG input")
+    return temporary_file.name, temporary_file.name
 
 
 class ModelManager(QObject):
@@ -104,10 +165,11 @@ class ModelManager(QObject):
                 model_config = yaml.safe_load(config_content)
                 model_config["config_file"] = str(config_file)
             else:  # Config file is in local file system
-                with open(config_file, "r", encoding="utf-8") as f:
+                resolved_path = _resolve_config_path(config_file)
+                with open(resolved_path, "r", encoding="utf-8") as f:
                     model_config = yaml.safe_load(f)
                     model_config["config_file"] = os.path.normpath(
-                        os.path.abspath(config_file)
+                        os.path.abspath(resolved_path)
                     )
             is_custom = model.get("is_custom_model", False)
             model_config["is_custom_model"] = is_custom
@@ -2401,6 +2463,35 @@ class ModelManager(QObject):
                 return model.recompute_background_strips(shapes, H, W)
         return [], []
 
+    def fine_tune_on_checked_images(
+        self,
+        data_items,
+        epochs=None,
+        lr=None,
+        train_ratio=None,
+        progress_cb=None,
+        cancel_event=None,
+    ):
+        """Fine-tune the loaded track_mask2former model using checked images.
+
+        Delegates to the loaded model. Returns (num_samples, saved_path).
+        """
+        if self.loaded_model_config is None:
+            raise RuntimeError(self.tr("Model is not loaded."))
+        model = self.loaded_model_config.get("model")
+        if model is None or not hasattr(model, "fine_tune_on_checked_images"):
+            raise RuntimeError(
+                self.tr("The loaded model does not support fine-tuning.")
+            )
+        return model.fine_tune_on_checked_images(
+            data_items,
+            epochs=epochs,
+            lr=lr,
+            train_ratio=train_ratio,
+            progress_cb=progress_cb,
+            cancel_event=cancel_event,
+        )
+
     def unload_model(self):
         """Unload model"""
         if self.loaded_model_config is not None:
@@ -2429,22 +2520,25 @@ class ModelManager(QObject):
             self.prediction_finished.emit()
             return
 
+        model_filename, temporary_filename = _prepare_tiff_model_input(
+            image, filename
+        )
         try:
             if text_prompt is not None:
                 auto_labeling_result = model_config["model"].predict_shapes(
-                    image, filename, text_prompt=text_prompt
+                    image, model_filename, text_prompt=text_prompt
                 )
             elif run_tracker is True:
                 auto_labeling_result = model_config["model"].predict_shapes(
-                    image, filename, run_tracker=run_tracker
+                    image, model_filename, run_tracker=run_tracker
                 )
             elif existing_shapes is not None:
                 auto_labeling_result = model_config["model"].predict_shapes(
-                    image, filename, existing_shapes=existing_shapes
+                    image, model_filename, existing_shapes=existing_shapes
                 )
             else:
                 auto_labeling_result = model_config["model"].predict_shapes(
-                    image, filename
+                    image, model_filename
                 )
 
             if isinstance(auto_labeling_result, AutoLabelingResult):
@@ -2464,6 +2558,12 @@ class ModelManager(QObject):
             translated_template = self.tr(template)
             error_text = translated_template.format(error_message=str(e))
             self.new_model_status.emit(error_text)
+        finally:
+            if temporary_filename:
+                try:
+                    os.unlink(temporary_filename)
+                except OSError:
+                    pass
 
         self.prediction_finished.emit()
 

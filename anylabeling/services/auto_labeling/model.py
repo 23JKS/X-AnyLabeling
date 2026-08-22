@@ -1,11 +1,12 @@
 import os
-import pathlib
+import sys
 import yaml
 import urllib.request
 import time
 import multiprocessing
 from urllib.parse import urlparse
 from urllib.error import URLError
+from pathlib import Path
 
 import socket
 
@@ -212,30 +213,123 @@ class Model(QObject):
 
     def get_model_abs_path(self, model_config, model_path_field_name):
         """
-        Get model absolute path from config path or download from url
+        Get model absolute path from config path or download from url.
+        Handles both source-tree and PyInstaller bundle execution.
         """
-        # Try getting model path from config folder
         model_path = model_config[model_path_field_name]
 
-        # Model path is a local path
-        if not model_path.startswith(("http://", "https://")):
-            # Relative path to executable or absolute path?
-            model_abs_path = os.path.abspath(model_path)
-            if os.path.exists(model_abs_path):
-                return model_abs_path
+        def _bundle_roots():
+            roots = []
 
-            # Relative path to config file?
-            config_file_path = model_config["config_file"]
-            config_folder = os.path.dirname(config_file_path)
-            model_abs_path = os.path.abspath(
-                os.path.join(config_folder, model_path)
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                roots.append(Path(meipass).resolve())
+
+            executable = getattr(sys, "executable", None)
+            if executable:
+                exe_path = Path(executable).resolve()
+                roots.append(exe_path.parent)
+                if exe_path.parent.name.lower() in {"dist", "build"}:
+                    roots.append(exe_path.parent.parent)
+                if exe_path.parent.parent.name.lower() in {"dist", "build"}:
+                    roots.append(exe_path.parent.parent)
+
+            seen = set()
+            ordered = []
+            for root in roots:
+                normalized = str(root)
+                if normalized not in seen:
+                    seen.add(normalized)
+                    ordered.append(root)
+            return ordered
+
+        if model_path.startswith(("http://", "https://")):
+            self.on_message(
+                QCoreApplication.translate(
+                    "Model", "Downloading model from registry..."
+                )
             )
-            if os.path.exists(model_abs_path):
-                return model_abs_path
+            # Build download url
+            def get_filename_from_url(url):
+                a = urlparse(url)
+                return os.path.basename(a.path)
 
-            raise QCoreApplication.translate(
-                "Model", "Model path not found: {model_path}"
-            ).format(model_path=model_path)
+            filename = get_filename_from_url(model_path)
+            download_url = model_path
+
+            # Continue with the rest of your function logic
+            migrate_flag = self.allow_migrate_data()
+            work_dir = get_work_directory()
+            data_dir = "xanylabeling_data" if migrate_flag else "anylabeling_data"
+
+            # Create model folder
+            model_dir = os.path.join(work_dir, data_dir, "models")
+            os.makedirs(model_dir, exist_ok=True)
+            dest_path = os.path.join(model_dir, filename)
+
+            # Download file if missing or not valid
+            if not os.path.exists(dest_path):
+                self.on_message(
+                    QCoreApplication.translate(
+                        "Model", "Downloading model to: {path}"
+                    ).format(path=dest_path)
+                )
+                try:
+                    self.download_with_retry(
+                        download_url, dest_path, self._on_progress
+                    )
+                except DownloadCancelledError:
+                    raise
+            return dest_path
+
+        if not model_path.startswith(("http://", "https://")):
+            project_root = Path(__file__).resolve().parents[3]
+            candidate_paths = []
+            bundle_roots = _bundle_roots()
+
+            for bundle_root in bundle_roots:
+                candidate_paths.extend(
+                    [
+                        str(bundle_root / model_path),
+                        str(bundle_root / "anylabeling" / model_path),
+                        str(bundle_root / "resources" / model_path),
+                    ]
+                )
+
+            if os.path.isabs(model_path):
+                candidate_paths.append(model_path)
+            else:
+                candidate_paths.extend(
+                    [
+                        os.path.abspath(model_path),
+                        os.path.abspath(os.path.join(project_root, model_path)),
+                        os.path.abspath(
+                            os.path.join(project_root, "anylabeling", model_path)
+                        ),
+                    ]
+                )
+
+            config_file_path = model_config.get("config_file")
+            if config_file_path:
+                config_folder = os.path.dirname(config_file_path)
+                candidate_paths.append(
+                    os.path.abspath(os.path.join(config_folder, model_path))
+                )
+
+            seen = set()
+            for candidate in candidate_paths:
+                normalized = os.path.normpath(os.path.abspath(candidate))
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                if os.path.exists(normalized):
+                    return normalized
+
+            raise ValueError(
+                QCoreApplication.translate(
+                    "Model", "Model path not found: {model_path}"
+                ).format(model_path=model_path)
+            )
 
         # Download model from url
         self.on_message(

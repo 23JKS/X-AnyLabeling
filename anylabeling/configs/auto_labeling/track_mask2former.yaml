@@ -9,7 +9,7 @@ dE_MeV: -0.2
 display_name: Track Mask2Former (Auto Width)
 ip_fading_exponent: -0.161
 ip_fading_ref_min: 30.0
-model_path: C:/Users/Lenovo/Desktop/project/mask2former_plus/checkpoints/best_model
+model_path: anylabeling/services/auto_labeling/models/mask2former_plus/checkpoints/best_model
 name: track_mask2former
 plate_model_path: anylabeling/services/auto_labeling/models/plate_yolo/best.pt
 provider: Local
