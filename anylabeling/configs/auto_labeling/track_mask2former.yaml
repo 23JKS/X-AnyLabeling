@@ -1,7 +1,7 @@
 E_bin_max: 60.0
 E_bin_min: 1.0
 al_density_g_cm3: 2.7
-al_range_energy_path: C:/Users/Lenovo/Desktop/质子穿透.xlsx
+al_range_energy_path: ''
 al_range_energy_sheet: Al
 al_thickness_cm: 0.0015
 conf_threshold: 0.3
@@ -13,6 +13,6 @@ model_path: anylabeling/services/auto_labeling/models/mask2former_plus/checkpoin
 name: track_mask2former
 plate_model_path: anylabeling/services/auto_labeling/models/plate_yolo/best.pt
 provider: Local
-r_to_e_path: C:/Users/Lenovo/Desktop/r_E_proton_TP3_0822.txt
+r_to_e_path: ''
 r_tp_cm: 90.0
 type: track_mask2former

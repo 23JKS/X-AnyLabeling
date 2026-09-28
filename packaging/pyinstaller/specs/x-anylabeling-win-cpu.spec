@@ -6,7 +6,7 @@ import os
 import re
 import sys
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 
 sys.setrecursionlimit(5000)  # required on Windows
 
@@ -142,14 +142,61 @@ def _strip_msvc_runtime_binaries(binaries):
         )
     return kept
 
+# Qt6Core.dll links dynamically against the ICU that Windows itself ships in
+# System32 (the unversioned names icuuc.dll / icuin.dll / icu.dll).
+# Conda environments ship a *different* ICU build under those very same names
+# in <env>/Library/bin, and that directory sits on PATH during a build, so
+# PyInstaller happily bundles it into the app root where it shadows the system
+# DLL.  Qt then dies at startup with:
+#   ImportError: DLL load failed while importing QtCore:
+#   The specified procedure could not be found.   (ERROR_PROC_NOT_FOUND)
+# Windows' own ICU must win, so never bundle these names.
+SYSTEM_ICU_DLL_NAMES = {'icu.dll', 'icuuc.dll', 'icuin.dll'}
+_SYSTEM_ICU_DATA_RE = re.compile(r'^icudt\d*\.dll$')
+
+
+def _strip_system_icu_binaries(binaries):
+    kept = []
+    removed = []
+    for entry in binaries:
+        shadowing = [
+            name
+            for name in _entry_dll_names(entry)
+            if name in SYSTEM_ICU_DLL_NAMES or _SYSTEM_ICU_DATA_RE.match(name)
+        ]
+        if shadowing:
+            removed.extend(shadowing)
+            continue
+        kept.append(entry)
+    if removed:
+        print(
+            "PyInstaller spec: excluded system-shadowing ICU DLLs "
+            "(Windows provides these in System32):",
+            ", ".join(sorted(set(removed))),
+        )
+    return kept
+
 onnxruntime_binaries = _collect_onnxruntime_dlls()
 msvc_runtime_binaries = _collect_msvc_runtime_dlls()
 matplotlib_datas = collect_data_files('matplotlib')
 
+# torchvision loads its compiled ops extension at runtime with
+# torch.ops.load_library(_get_extension_path("_C_stable")), i.e. a plain file
+# path rather than an `import`, so PyInstaller's static analysis cannot see it
+# and does not bundle torchvision/_C_stable.pyd or image_stable.pyd.  The
+# loader swallows that failure silently (extension._load_library returns
+# False), so the packaged app starts fine but later dies inside transformers
+# with:  RuntimeError: operator torchvision::nms does not exist
+# collect_dynamic_libs defaults to *.dll only, hence the explicit patterns
+# (*.pyd is the Windows extension-module suffix).  The sibling jpeg/png/webp/
+# zlib DLLs are the codec dependencies of image_stable.pyd.
+torchvision_binaries = collect_dynamic_libs(
+    'torchvision', search_patterns=['*.pyd', '*.dll'])
+
 a = Analysis(
     [_p('anylabeling', 'app.py')],
     pathex=[_p('anylabeling')],
-    binaries=onnxruntime_binaries,
+    binaries=onnxruntime_binaries + torchvision_binaries,
     datas=[
         (_p('anylabeling', 'configs', '*'), 'anylabeling/configs'),
         (_p('anylabeling', 'resources', '*'), 'anylabeling/resources'),
@@ -164,12 +211,17 @@ a = Analysis(
         'matplotlib.backends.backend_agg',
         'matplotlib.font_manager',
         'matplotlib.mathtext',
+        # Energy-spectrum pipeline: pandas/openpyxl are imported lazily inside
+        # functions (Excel range-energy tables), so list them explicitly.
+        'pandas',
+        'openpyxl',
     ],
     hookspath=[],
     runtime_hooks=[_p('packaging', 'pyinstaller', 'runtime_hooks', 'ort_dll_bootstrap.py')],
     excludes=[],
 )
 a.binaries = _strip_msvc_runtime_binaries(a.binaries)
+a.binaries = _strip_system_icu_binaries(a.binaries)
 if msvc_runtime_binaries:
     a.binaries += _to_binary_toc_entries(msvc_runtime_binaries)
 pyz = PYZ(a.pure, a.zipped_data)

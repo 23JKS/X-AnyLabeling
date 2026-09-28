@@ -10,11 +10,20 @@ import tempfile
 import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
-# Debug log file
-_DEBUG_LOG = r"C:\Users\Lenovo\Desktop\log.txt"
+# Debug logs go to a writable per-machine temp folder: no hard-coded paths,
+# so the app can run on any computer without a fixed user directory.
+_DEBUG_DIR = os.path.join(tempfile.gettempdir(), "xanylabeling_debug")
+
+
 def _dbg(msg):
-    with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
+    """Append one debug line. Never raises — logging must not break the app."""
+    try:
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+        with open(os.path.join(_DEBUG_DIR, "plate_panel.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 from anylabeling.views.labeling.utils.colormap import label_colormap
 from anylabeling.services.auto_labeling.track_mask2former import (
@@ -354,17 +363,33 @@ class PlateDialog(QtWidgets.QDialog):
         self._visible_labels = {}  # label -> bool, populated per plate
         self._label_items = {}     # label -> QListWidgetItem, for checkbox signals
 
-        # --- Load persisted global settings from YAML (fallback to defaults) ---
+        # --- Load persisted settings ---------------------------------------
+        # Defaults come from the packaged model config; the user's own choices
+        # (table paths etc.) are stored per machine in the user profile, so
+        # they are remembered on the next launch and also work when the
+        # program folder itself is not writable (e.g. Program Files).
         import yaml
         import importlib.resources as pkg_resources
         import anylabeling.configs.auto_labeling as auto_labeling_configs
-        self._cfg_path = str(
-            pkg_resources.files(auto_labeling_configs) / "track_mask2former.yaml"
+        self._cfg_path = os.path.join(
+            os.path.expanduser("~"),
+            ".xanylabeling",
+            "track_mask2former_settings.yaml",
         )
         _cfg = {}
         try:
-            with open(self._cfg_path, "r", encoding="utf-8") as f:
+            with open(
+                pkg_resources.files(auto_labeling_configs)
+                / "track_mask2former.yaml",
+                "r",
+                encoding="utf-8",
+            ) as f:
                 _cfg = yaml.safe_load(f) or {}
+        except Exception:
+            pass
+        try:
+            with open(self._cfg_path, "r", encoding="utf-8") as f:
+                _cfg.update(yaml.safe_load(f) or {})
         except Exception:
             pass
         self._r_to_e_path_default = _cfg.get("r_to_e_path", "")
@@ -805,8 +830,12 @@ class PlateDialog(QtWidgets.QDialog):
 
     # ------------------------------------------------------------------
     def _save_config_value(self, key, value):
-        """Persist a single key-value pair to the YAML config file."""
+        """Persist a single key-value pair to the per-user settings file."""
         import yaml
+        try:
+            os.makedirs(os.path.dirname(self._cfg_path), exist_ok=True)
+        except Exception:
+            return  # nowhere to write: keep the in-memory value only
         try:
             with open(self._cfg_path, "r", encoding="utf-8") as f:
                 cfg = yaml.safe_load(f) or {}
@@ -916,11 +945,19 @@ class PlateDialog(QtWidgets.QDialog):
 
         from anylabeling.services.auto_labeling.spectrum import (
             load_r_to_e_table, load_al_range_energy_table)
-        if rp and os.path.isfile(rp):
-            r_to_e_func = load_r_to_e_table(rp)
-        if arp and os.path.isfile(arp):
-            sheet = self._al_sheet_combo.currentText()
-            al_e_to_range, al_range_to_e = load_al_range_energy_table(arp, sheet_name=sheet)
+        try:
+            if rp and os.path.isfile(rp):
+                r_to_e_func = load_r_to_e_table(rp)
+            if arp and os.path.isfile(arp):
+                sheet = self._al_sheet_combo.currentText()
+                al_e_to_range, al_range_to_e = load_al_range_energy_table(
+                    arp, sheet_name=sheet)
+        except Exception as e:
+            # A bad/missing table must not kill the app: report and stop.
+            QtWidgets.QMessageBox.warning(
+                self, "错误",
+                f"能量表文件无法读取，请重新选择文件:\n{e}")
+            return
 
         try:
             ylim_min = float(self._ylim_min_edit.text())
@@ -987,7 +1024,7 @@ class PlateDialog(QtWidgets.QDialog):
             return cl[-1][0]
 
         def _dump_aligned_bg_pixels(label, track_poly, bg_cl, raw_img):
-            log_dir = r"C:\Users\Lenovo\Desktop\log"
+            log_dir = _DEBUG_DIR
             os.makedirs(log_dir, exist_ok=True)
             out_path = os.path.join(log_dir, f"{label}_background_pixels.txt")
             h, w = raw_img.shape
@@ -1010,7 +1047,7 @@ class PlateDialog(QtWidgets.QDialog):
                     f.write(f"{int(y)}【{vals}】\n")
 
         def _dump_polygon_pixels(label, tag, poly, raw_img):
-            log_dir = r"C:\Users\Lenovo\Desktop\log"
+            log_dir = _DEBUG_DIR
             os.makedirs(log_dir, exist_ok=True)
             out_path = os.path.join(log_dir, f"{label}_{tag}_pixels.txt")
             h, w = raw_img.shape
@@ -1201,9 +1238,7 @@ class PlateDialog(QtWidgets.QDialog):
                 by_ = [p[1] for p in my_bg_polygon]
                 _dbg(f"[spectrum] {label}: track X [{min(tx):.1f}, {max(tx):.1f}] w={max(tx)-min(tx):.1f}  Y [{min(ty):.1f}, {max(ty):.1f}]")
                 _dbg(f"[spectrum] {label}: bg    X [{min(bx):.1f}, {max(bx):.1f}] w={max(bx)-min(bx):.1f}  Y [{min(by_):.1f}, {max(by_):.1f}]")
-                with open(r"C:\Users\Lenovo\Desktop\2.txt", "a", encoding="utf-8") as _f2:
-                    _f2.write(f"{label}: track X=[{min(tx):.1f},{max(tx):.1f}] w={max(tx)-min(tx):.1f}  Y=[{min(ty):.1f},{max(ty):.1f}]\n")
-                    _f2.write(f"{label}: bg    X=[{min(bx):.1f},{max(bx):.1f}] w={max(bx)-min(bx):.1f}  Y=[{min(by_):.1f},{max(by_):.1f}]  (track_tw={track_tw})\n")
+                _dbg(f"[spectrum] {label}: (track_tw={track_tw})")
 
                 r = compute_track_spectrum(
                     track_polygon, my_bg_polygon, ip_image,

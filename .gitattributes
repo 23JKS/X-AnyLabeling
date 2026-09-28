@@ -1,5 +1,4 @@
 * text=auto
-
 # Source code and text files
 *.py text eol=lf
 *.pyi text eol=lf
@@ -21,11 +20,9 @@
 *.html text eol=lf
 *.css text eol=lf
 *.js text eol=lf
-
 # Windows scripts
 *.bat text eol=crlf
 *.cmd text eol=crlf
-
 # Binary assets and model artifacts
 *.png binary
 *.jpg binary
@@ -48,3 +45,5 @@
 *.mp4 binary
 *.avi binary
 *.mov binary
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+anylabeling/services/auto_labeling/models/** filter=lfs diff=lfs merge=lfs -text

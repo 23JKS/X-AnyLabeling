@@ -739,7 +739,11 @@ def _segment_plate(crop, model, device, model_abs_path, conf=0.5):
     with torch.no_grad():
         outputs = model(pixel_values=inp)
 
-    from transformers import Mask2FormerImageProcessor
+    # Concrete module import, for the same reason as in _load_model: the lazy
+    # top-level registry cannot reliably resolve classes in a frozen build.
+    from transformers.models.mask2former.image_processing_mask2former import (
+        Mask2FormerImageProcessor,
+    )
     # Load the processor from the local checkpoint directory (which ships with
     # preprocessor_config.json) instead of the online HuggingFace repo. The
     # online repo requires a local HF cache that does not exist on a fresh
@@ -905,10 +909,23 @@ class TrackMask2Former(Model):
 
     def _load_model(self):
         self.on_message("Loading Mask2Former model...")
-        from transformers import (
-            Mask2FormerForUniversalSegmentation,
-            Mask2FormerConfig,
-        )
+        # Import the concrete modules instead of going through transformers'
+        # lazy top-level registry.  In a frozen (PyInstaller) build that
+        # registry cannot always resolve class -> module and only reports
+        # "Could not import module 'Mask2FormerForUniversalSegmentation'".
+        try:
+            from transformers.models.mask2former.modeling_mask2former import (
+                Mask2FormerForUniversalSegmentation,
+            )
+            from transformers.models.mask2former.configuration_mask2former import (
+                Mask2FormerConfig,
+            )
+        except Exception:
+            logger.error(
+                "Failed to import the Mask2Former classes from transformers:\n%s",
+                traceback.format_exc(),
+            )
+            raise
         self.model = Mask2FormerForUniversalSegmentation.from_pretrained(
             str(self.model_abs_path),
             num_labels=2,

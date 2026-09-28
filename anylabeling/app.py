@@ -333,6 +333,32 @@ def main():
             )
 
     app = QtWidgets.QApplication(sys.argv)
+
+    # PyQt6 calls Qt's qFatal() -> abort() when a Python exception escapes a
+    # slot, which kills the whole process without any message (Windows event
+    # code 0xc0000409, faulting module Qt6Core.dll).  Installing an excepthook
+    # overrides that behaviour: the error is logged and shown to the user and
+    # the app keeps running.
+    def _on_uncaught_exception(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logger.error(
+            "Unhandled exception",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+        try:
+            QtWidgets.QMessageBox.critical(
+                None,
+                "发生错误",
+                "当前操作出错，程序已捕获该错误并未退出：\n\n"
+                f"{exc_type.__name__}: {exc_value}",
+            )
+        except Exception:
+            pass
+
+    sys.excepthook = _on_uncaught_exception
+
     init_theme(config.get("theme", "light"))
     _dark_palette = get_dark_palette()
     if _dark_palette is not None:

@@ -23,11 +23,20 @@ import numpy as np
 import cv2
 from scipy.interpolate import interp1d
 
-# Debug log file
-_DEBUG_LOG = r"C:\Users\Lenovo\Desktop\log.txt"
+# Debug logs go to a writable per-machine temp folder: no hard-coded paths,
+# so the app can run on any computer without a fixed user directory.
+_DEBUG_DIR = os.path.join(tempfile.gettempdir(), "xanylabeling_debug")
+
+
 def _dbg(msg):
-    with open(_DEBUG_LOG, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
+    """Append one debug line. Never raises — logging must not break the app."""
+    try:
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+        with open(os.path.join(_DEBUG_DIR, "spectrum.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Physical defaults — override via config / function arguments
@@ -303,9 +312,8 @@ def compute_track_spectrum(
     if debug_raw_image is not None and debug_label is not None:
         try:
             ys_dbg = np.where(track_mask.sum(axis=1) > 0)[0]
-            log_path = os.path.join(
-                r"C:\Users\Lenovo\Desktop\log", debug_label
-            )
+            os.makedirs(_DEBUG_DIR, exist_ok=True)
+            log_path = os.path.join(_DEBUG_DIR, debug_label)
             with open(log_path, "w", encoding="utf-8") as _f:
                 _f.write(f"# Track: {debug_label}\n")
                 _f.write(f"# {'row_y':>5s}  raw_QL_values\n")
@@ -430,11 +438,16 @@ def compute_track_spectrum(
     # Debug: dump per-row PSL to file (only for normal run, not skip_bg)
     if not skip_bg:
         _bg_arr = locals().get("PSL_bg_interp", None)
-        with open(r"C:\Users\Lenovo\Desktop\1.txt", "w", encoding="utf-8") as _f:
-            _f.write(f"{'row':>5s}  {'R_mm':>10s}  {'PSL_raw':>14s}  {'PSL_bg':>14s}  {'PSL_net':>14s}  {'PSL_mm2':>14s}\n")
-            for _j in range(len(R_y)):
-                _bg_val = _bg_arr[_j] if _bg_arr is not None else 0.0
-                _f.write(f"{_j:5d}  {R_mm[_j]:10.4f}  {PSL_signal_raw[_j]:14.6e}  {_bg_val:14.6e}  {PSL_net[_j]:14.6e}  {PSL_mm2[_j]:14.6e}\n")
+        try:
+            os.makedirs(_DEBUG_DIR, exist_ok=True)
+            with open(os.path.join(_DEBUG_DIR, "spectrum_rows.tsv"), "w",
+                      encoding="utf-8") as _f:
+                _f.write(f"{'row':>5s}  {'R_mm':>10s}  {'PSL_raw':>14s}  {'PSL_bg':>14s}  {'PSL_net':>14s}  {'PSL_mm2':>14s}\n")
+                for _j in range(len(R_y)):
+                    _bg_val = _bg_arr[_j] if _bg_arr is not None else 0.0
+                    _f.write(f"{_j:5d}  {R_mm[_j]:10.4f}  {PSL_signal_raw[_j]:14.6e}  {_bg_val:14.6e}  {PSL_net[_j]:14.6e}  {PSL_mm2[_j]:14.6e}\n")
+        except Exception as e:
+            _dbg(f"[debug] failed to write row table: {e}")
 
     # --- Step 4: R(mm) → E_ip (MeV, energy at IP plate) ------------------
     E_ip = np.asarray(r_to_e_func(R_mm), dtype=np.float64)
